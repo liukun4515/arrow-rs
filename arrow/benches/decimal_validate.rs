@@ -18,12 +18,11 @@
 #[macro_use]
 extern crate criterion;
 
+use std::io::Write;
 use arrow::array::{
     Array, Decimal128Array, Decimal128Builder, Decimal256Array, Decimal256Builder,
 };
-use arrow::datatypes::{
-    validate_decimal_precision, validate_decimal_precision_with_bytes,
-};
+use arrow::datatypes::{ToByteSlice, validate_decimal_precision, validate_decimal_precision_with_bytes};
 use criterion::Criterion;
 use rand::Rng;
 
@@ -49,28 +48,57 @@ fn validate_decimal256_array(array: Decimal256Array) {
 
 // remove from the commit
 // https://github.com/apache/arrow-rs/pull/2360/commits/364929e918bdb0e96bc931424de615cbc18af8cb
-fn validate_decimal128_using_bytes(array: &[[u8; 16]], precision: usize) {
-    for value in array {
-        validate_decimal_precision_with_bytes(value, precision).unwrap();
+// fn validate_decimal128_using_bytes(array: &[[u8; 16]], precision: usize) {
+//     for value in array {
+//         validate_decimal_precision_with_bytes(value, precision).unwrap();
+//     }
+// }
+//
+// fn validate_decimal128_using_i128(array: &[[u8; 16]], precision: usize) {
+//     // convert the the element to decimal128
+//     for v in array {
+//         let decimal = Decimal128::new(precision, 0, v);
+//         validate_decimal_precision(decimal.as_i128(), precision).unwrap();
+//     }
+// }
+
+fn validate_decimal128_using_bytes(array: &[u8], precision: usize) {
+    unsafe {
+        for i in 0..array.len()/16 {
+            let bytes = &array[i*16..(i+1)*16];
+            validate_decimal_precision_with_bytes(bytes, precision).unwrap();
+        }
     }
+
 }
 
-fn validate_decimal128_using_i128(array: &[[u8; 16]], precision: usize) {
-    // convert the the element to decimal128
-    for v in array {
-        let decimal = Decimal128::new(precision, 0, v);
-        validate_decimal_precision(decimal.as_i128(), precision).unwrap();
+fn validate_decimal128_using_i128(array: &[u8], precision: usize) {
+    unsafe {
+        for i in 0..array.len()/16 {
+            let bytes = &array[i*16..(i+1)*16];
+            let decimal = Decimal128::new(precision, 0, bytes);
+            validate_decimal_precision(decimal.as_i128(), precision).unwrap();
+        }
     }
 }
 
 fn validate_decimal128_cmp_i128_with_bytes_benchmark(c: &mut Criterion) {
-    // create the [u8;16] array
-    let mut array: Vec<[u8; 16]> = vec![];
+    // decimal array
     let mut rng = rand::thread_rng();
-    for i in 0..200000 {
+    let size: i128 = 20000;
+    let mut decimal_builder = Decimal128Builder::new(size as usize, 38, 0);
+
+    // create the [u8;16] array
+    let mut array: Vec<u8> = vec![0; (size * 16) as usize];
+    // let mut array: Vec<[u8;16]> = vec![];
+    let mut rng = rand::thread_rng();
+    for i in 0..size {
         // array.push((i as i128).to_le_bytes());
-        array.push((rng.gen_range::<i128, _>(0..999999999999)).to_le_bytes());
+        // decimal_builder.append_value((rng.gen_range::<i128, _>(0..999999999999))).unwrap();
+        let bytes = &rng.gen_range::<i128, _>(0..999999999999).to_le_bytes();
+        array.write_all(bytes).unwrap();
     }
+    // let decimal_array = decimal_builder.finish();
 
     c.bench_function("validate_decimal128_bytes 20000", |b| {
         b.iter(|| validate_decimal128_using_bytes(&array, 35))
@@ -83,7 +111,7 @@ fn validate_decimal128_cmp_i128_with_bytes_benchmark(c: &mut Criterion) {
 
 fn validate_decimal128_benchmark(c: &mut Criterion) {
     let mut rng = rand::thread_rng();
-    let size: i128 = 200000;
+    let size: i128 = 20000;
     let mut decimal_builder = Decimal128Builder::new(size as usize, 38, 0);
     for i in 0..size {
         decimal_builder

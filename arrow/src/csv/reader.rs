@@ -776,8 +776,17 @@ fn parse_decimal_with_parameter(s: &str, precision: usize, scale: usize) -> Resu
         if negative {
             result = result.neg();
         }
-        validate_decimal_precision(result, precision)
-            .map_err(|e| ArrowError::ParseError(format!("parse decimal overflow: {}", e)))
+        match validate_decimal_precision(result, precision) {
+            Ok(_) => {
+                Ok(result)
+            }
+            Err(e) => {
+                Err(ArrowError::ParseError(format!("parse decimal overflow: {}", e)))
+            }
+        }
+        // TODO handler
+        // validate_decimal_precision(result, precision)
+        //     .map_err(|e| ArrowError::ParseError(format!("parse decimal overflow: {}", e)))
     } else {
         Err(ArrowError::ParseError(format!(
             "can't parse the string value {} to decimal",

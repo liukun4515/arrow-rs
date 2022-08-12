@@ -989,7 +989,7 @@ pub const DECIMAL_DEFAULT_SCALE: usize = 10;
 /// Validates that the specified `i128` value can be properly
 /// interpreted as a Decimal number with precision `precision`
 #[inline]
-pub(crate) fn validate_decimal_precision(value: i128, precision: usize) -> Result<i128> {
+pub fn validate_decimal_precision(value: i128, precision: usize) -> Result<()> {
     if precision > DECIMAL128_MAX_PRECISION {
         return Err(ArrowError::InvalidArgumentError(format!(
             "Max precision of a Decimal128 is {}, but got {}",
@@ -1011,7 +1011,122 @@ pub(crate) fn validate_decimal_precision(value: i128, precision: usize) -> Resul
             value, precision, min
         )))
     } else {
-        Ok(value)
+        Ok(())
+    }
+}
+
+// Max decimal128 value of little-endian format for each precision.
+pub(crate) const MAX_DECIMAL_BYTES_FOR_EACH_PRECISION: [[u8; 16]; 38] = [
+    9_i128.to_le_bytes(),
+    99_i128.to_le_bytes(),
+    999_i128.to_le_bytes(),
+    9999_i128.to_le_bytes(),
+    99999_i128.to_le_bytes(),
+    999999_i128.to_le_bytes(),
+    9999999_i128.to_le_bytes(),
+    99999999_i128.to_le_bytes(),
+    999999999_i128.to_le_bytes(),
+    9999999999_i128.to_le_bytes(),
+    99999999999_i128.to_le_bytes(),
+    999999999999_i128.to_le_bytes(),
+    9999999999999_i128.to_le_bytes(),
+    99999999999999_i128.to_le_bytes(),
+    999999999999999_i128.to_le_bytes(),
+    9999999999999999_i128.to_le_bytes(),
+    99999999999999999_i128.to_le_bytes(),
+    999999999999999999_i128.to_le_bytes(),
+    9999999999999999999_i128.to_le_bytes(),
+    99999999999999999999_i128.to_le_bytes(),
+    999999999999999999999_i128.to_le_bytes(),
+    9999999999999999999999_i128.to_le_bytes(),
+    99999999999999999999999_i128.to_le_bytes(),
+    999999999999999999999999_i128.to_le_bytes(),
+    9999999999999999999999999_i128.to_le_bytes(),
+    99999999999999999999999999_i128.to_le_bytes(),
+    999999999999999999999999999_i128.to_le_bytes(),
+    9999999999999999999999999999_i128.to_le_bytes(),
+    99999999999999999999999999999_i128.to_le_bytes(),
+    999999999999999999999999999999_i128.to_le_bytes(),
+    9999999999999999999999999999999_i128.to_le_bytes(),
+    99999999999999999999999999999999_i128.to_le_bytes(),
+    999999999999999999999999999999999_i128.to_le_bytes(),
+    9999999999999999999999999999999999_i128.to_le_bytes(),
+    99999999999999999999999999999999999_i128.to_le_bytes(),
+    999999999999999999999999999999999999_i128.to_le_bytes(),
+    9999999999999999999999999999999999999_i128.to_le_bytes(),
+    99999999999999999999999999999999999999_i128.to_le_bytes(),
+];
+
+// Min decimal128 value of little-endian format for each precision.
+pub(crate) const MIN_DECIMAL_BYTES_FOR_EACH_PRECISION: [[u8; 16]; 38] = [
+    (-9_i128).to_le_bytes(),
+    (-99_i128).to_le_bytes(),
+    (-999_i128).to_le_bytes(),
+    (-9999_i128).to_le_bytes(),
+    (-99999_i128).to_le_bytes(),
+    (-999999_i128).to_le_bytes(),
+    (-9999999_i128).to_le_bytes(),
+    (-99999999_i128).to_le_bytes(),
+    (-999999999_i128).to_le_bytes(),
+    (-9999999999_i128).to_le_bytes(),
+    (-99999999999_i128).to_le_bytes(),
+    (-999999999999_i128).to_le_bytes(),
+    (-9999999999999_i128).to_le_bytes(),
+    (-99999999999999_i128).to_le_bytes(),
+    (-999999999999999_i128).to_le_bytes(),
+    (-9999999999999999_i128).to_le_bytes(),
+    (-99999999999999999_i128).to_le_bytes(),
+    (-999999999999999999_i128).to_le_bytes(),
+    (-9999999999999999999_i128).to_le_bytes(),
+    (-99999999999999999999_i128).to_le_bytes(),
+    (-999999999999999999999_i128).to_le_bytes(),
+    (-9999999999999999999999_i128).to_le_bytes(),
+    (-99999999999999999999999_i128).to_le_bytes(),
+    (-999999999999999999999999_i128).to_le_bytes(),
+    (-9999999999999999999999999_i128).to_le_bytes(),
+    (-99999999999999999999999999_i128).to_le_bytes(),
+    (-999999999999999999999999999_i128).to_le_bytes(),
+    (-9999999999999999999999999999_i128).to_le_bytes(),
+    (-99999999999999999999999999999_i128).to_le_bytes(),
+    (-999999999999999999999999999999_i128).to_le_bytes(),
+    (-9999999999999999999999999999999_i128).to_le_bytes(),
+    (-99999999999999999999999999999999_i128).to_le_bytes(),
+    (-999999999999999999999999999999999_i128).to_le_bytes(),
+    (-9999999999999999999999999999999999_i128).to_le_bytes(),
+    (-99999999999999999999999999999999999_i128).to_le_bytes(),
+    (-999999999999999999999999999999999999_i128).to_le_bytes(),
+    (-9999999999999999999999999999999999999_i128).to_le_bytes(),
+    (-99999999999999999999999999999999999999_i128).to_le_bytes(),
+];
+
+/// Validates that the specified `byte_array` of little-endian format
+/// value can be properly interpreted as a Decimal128 number with precision `precision`
+#[inline]
+pub fn validate_decimal_precision_with_bytes(
+    lt_value: &[u8],
+    precision: usize,
+) -> Result<()> {
+    if precision > DECIMAL128_MAX_PRECISION {
+        return Err(ArrowError::InvalidArgumentError(format!(
+            "Max precision of a Decimal128 is {}, but got {}",
+            DECIMAL128_MAX_PRECISION, precision,
+        )));
+    }
+
+    let max = MAX_DECIMAL_BYTES_FOR_EACH_PRECISION[precision - 1];
+    let min = MIN_DECIMAL_BYTES_FOR_EACH_PRECISION[precision - 1];
+    if singed_cmp_le_bytes(lt_value, &max) == Ordering::Greater {
+        Err(ArrowError::InvalidArgumentError(format!(
+            "{:?} is too large to store in a Decimal128 of precision {}. Max is {:?}",
+            lt_value, precision, max
+        )))
+    } else if singed_cmp_le_bytes(lt_value, &min) == Ordering::Less {
+        Err(ArrowError::InvalidArgumentError(format!(
+            "{:?} is too small to store in a Decimal128 of precision {}. Min is {:?}",
+            lt_value, precision, min
+        )))
+    } else {
+        Ok(())
     }
 }
 

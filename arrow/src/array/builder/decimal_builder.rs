@@ -85,14 +85,14 @@ impl Decimal128Builder {
     /// Appends a decimal value into the builder.
     #[inline]
     pub fn append_value(&mut self, value: impl Into<i128>) -> Result<()> {
-        let value = if self.value_validation {
-            validate_decimal_precision(value.into(), self.precision)?
-        } else {
-            value.into()
-        };
+        // let value = if self.value_validation {
+        //     validate_decimal_precision(value.into(), self.precision)?
+        // } else {
+        //     value.into()
+        // };
 
         let value_as_bytes =
-            Self::from_i128_to_fixed_size_bytes(value, Self::BYTE_LENGTH as usize)?;
+            Self::from_i128_to_fixed_size_bytes(value.into(), Self::BYTE_LENGTH as usize)?;
         if Self::BYTE_LENGTH != value_as_bytes.len() as i32 {
             return Err(ArrowError::InvalidArgumentError(
                 "Byte slice does not have the same length as Decimal128Builder value lengths".to_string()

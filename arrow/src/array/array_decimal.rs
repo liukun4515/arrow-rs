@@ -29,7 +29,10 @@ use super::{BasicDecimalIter, BooleanBufferBuilder, FixedSizeBinaryArray};
 #[allow(deprecated)]
 pub use crate::array::DecimalIter;
 use crate::buffer::{Buffer, MutableBuffer};
-use crate::datatypes::{validate_decimal256_precision_with_lt_bytes, DataType};
+use crate::datatypes::{
+    validate_decimal256_precision_with_lt_bytes, validate_decimal_precision_with_bytes,
+    DataType,
+};
 use crate::datatypes::{
     validate_decimal_precision, DECIMAL256_MAX_PRECISION, DECIMAL_DEFAULT_SCALE,
 };
@@ -272,11 +275,46 @@ impl Decimal128Array {
 
     // Validates decimal values in this array can be properly interpreted
     // with the specified precision.
-    fn validate_decimal_precision(&self, precision: usize) -> Result<()> {
-        for v in self.iter().flatten() {
-            validate_decimal_precision(v.as_i128(), precision)?;
-        }
-        Ok(())
+    pub fn validate_decimal_precision(&self, precision: usize) -> Result<()> {
+        (0..self.len()).try_for_each(|idx| {
+            if self.is_valid(idx) {
+                let decimal = unsafe {
+                    self.value_unchecked(idx)
+                };
+                validate_decimal_precision(decimal.as_i128(), precision)
+            } else {
+                Ok(())
+            }
+        })
+
+        // unsafe {
+        //     for i in 0..self.len() {
+        //         let v = self.value_unchecked(i);
+        //         // validate_decimal_precision_with_bytes(v.raw_value(), precision)?;
+        //         validate_decimal_precision(v.as_i128(), precision)?;
+        //     }
+        // }
+        // for v in self.iter().flatten() {
+        //     validate_decimal_precision(v.as_i128(), precision)?;
+        // }
+        // Ok(())
+    }
+
+    pub fn validate_decimal_with_bytes(&self, precision: usize) -> Result<()> {
+        (0..self.len()).try_for_each(|idx| {
+            if self.is_valid(idx) {
+                let raw_val = unsafe {
+                    let pos = self.value_offset(idx);
+                    std::slice::from_raw_parts(
+                        self.raw_value_data_ptr().offset(pos as isize),
+                        Self::VALUE_LENGTH as usize,
+                    )
+                };
+                validate_decimal_precision_with_bytes(raw_val, precision)
+            } else {
+                Ok(())
+            }
+        })
     }
 
     /// Returns a Decimal array with the same data as self, with the
