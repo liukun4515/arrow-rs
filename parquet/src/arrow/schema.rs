@@ -73,7 +73,7 @@ pub fn parquet_to_arrow_schema_by_columns(
     // Add the Arrow metadata to the Parquet metadata skipping keys that collide
     if let Some(arrow_schema) = &maybe_schema {
         arrow_schema.metadata().iter().for_each(|(k, v)| {
-            metadata.entry(k.clone()).or_insert(v.clone());
+            metadata.entry(k.clone()).or_insert_with(|| v.clone());
         });
     }
 
@@ -100,7 +100,7 @@ fn get_arrow_schema_from_metadata(encoded_meta: &str) -> Result<Schema> {
                 Ok(message) => message
                     .header_as_schema()
                     .map(arrow::ipc::convert::fb_to_schema)
-                    .ok_or(arrow_err!("the message is not Arrow Schema")),
+                    .ok_or_else(|| arrow_err!("the message is not Arrow Schema")),
                 Err(err) => {
                     // The flatbuffers implementation returns an error on verification error.
                     Err(arrow_err!(
@@ -380,7 +380,8 @@ fn arrow_to_parquet_type(field: &Field) -> Result<Type> {
                 .with_length(*length)
                 .build()
         }
-        DataType::Decimal(precision, scale) | DataType::Decimal256(precision, scale) => {
+        DataType::Decimal128(precision, scale)
+        | DataType::Decimal256(precision, scale) => {
             // Decimal precision determines the Parquet physical type to use.
             // TODO(ARROW-12018): Enable the below after ARROW-10818 Decimal support
             //
@@ -549,10 +550,10 @@ mod tests {
             parquet_to_arrow_schema(&parquet_schema, None).unwrap();
 
         let arrow_fields = vec![
-            Field::new("decimal1", DataType::Decimal(4,2), false),
-            Field::new("decimal2", DataType::Decimal(12,2), false),
-            Field::new("decimal3", DataType::Decimal(30,2), false),
-            Field::new("decimal4", DataType::Decimal(33,2), false),
+            Field::new("decimal1", DataType::Decimal128(4, 2), false),
+            Field::new("decimal2", DataType::Decimal128(12, 2), false),
+            Field::new("decimal3", DataType::Decimal128(30, 2), false),
+            Field::new("decimal4", DataType::Decimal128(33, 2), false),
         ];
         assert_eq!(&arrow_fields, converted_arrow_schema.fields());
     }
@@ -1575,9 +1576,9 @@ mod tests {
                 //     true,
                 // ),
                 Field::new("c35", DataType::Null, true),
-                Field::new("c36", DataType::Decimal(2, 1), false),
-                Field::new("c37", DataType::Decimal(50, 20), false),
-                Field::new("c38", DataType::Decimal(18, 12), true),
+                Field::new("c36", DataType::Decimal128(2, 1), false),
+                Field::new("c37", DataType::Decimal128(50, 20), false),
+                Field::new("c38", DataType::Decimal128(18, 12), true),
                 Field::new(
                     "c39",
                     DataType::Map(

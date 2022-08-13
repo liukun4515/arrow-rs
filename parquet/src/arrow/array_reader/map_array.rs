@@ -32,6 +32,7 @@ pub struct MapArrayReader {
     value_reader: Box<dyn ArrayReader>,
     data_type: ArrowType,
     map_def_level: i16,
+    #[allow(unused)]
     map_rep_level: i16,
 }
 
@@ -47,6 +48,7 @@ impl MapArrayReader {
             key_reader,
             value_reader,
             data_type,
+            // These are the wrong way round https://github.com/apache/arrow-rs/issues/1699
             map_def_level: rep_level,
             map_rep_level: def_level,
         }
@@ -62,9 +64,21 @@ impl ArrayReader for MapArrayReader {
         &self.data_type
     }
 
-    fn next_batch(&mut self, batch_size: usize) -> Result<ArrayRef> {
-        let key_array = self.key_reader.next_batch(batch_size)?;
-        let value_array = self.value_reader.next_batch(batch_size)?;
+    fn read_records(&mut self, batch_size: usize) -> Result<usize> {
+        let key_len = self.key_reader.read_records(batch_size)?;
+        let value_len = self.value_reader.read_records(batch_size)?;
+        // Check that key and value have the same lengths
+        if key_len != value_len {
+            return Err(general_err!(
+                "Map key and value should have the same lengths."
+            ));
+        }
+        Ok(key_len)
+    }
+
+    fn consume_batch(&mut self) -> Result<ArrayRef> {
+        let key_array = self.key_reader.consume_batch()?;
+        let value_array = self.value_reader.consume_batch()?;
 
         // Check that key and value have the same lengths
         let key_length = key_array.len();

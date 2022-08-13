@@ -35,6 +35,8 @@
 //! assert_eq!(7.0, c.value(2));
 //! ```
 
+use chrono::Timelike;
+use std::ops::{Div, Mul};
 use std::str;
 use std::sync::Arc;
 
@@ -45,10 +47,14 @@ use crate::compute::kernels::arity::unary;
 use crate::compute::kernels::cast_utils::string_to_timestamp_nanos;
 use crate::datatypes::*;
 use crate::error::{ArrowError, Result};
+use crate::temporal_conversions::{
+    EPOCH_DAYS_FROM_CE, MICROSECONDS, MILLISECONDS, MILLISECONDS_IN_DAY, NANOSECONDS,
+    SECONDS_IN_DAY,
+};
 use crate::{array::*, compute::take};
 use crate::{buffer::Buffer, util::serialization::lexical_to_string};
 use num::cast::AsPrimitive;
-use num::{NumCast, ToPrimitive};
+use num::{BigInt, NumCast, ToPrimitive};
 
 /// CastOptions provides a way to override the default cast behaviors
 #[derive(Debug)]
@@ -72,11 +78,14 @@ pub fn can_cast_types(from_type: &DataType, to_type: &DataType) -> bool {
     match (from_type, to_type) {
         // TODO UTF8/unsigned numeric to decimal
         // cast one decimal type to another decimal type
-        (Decimal(_, _), Decimal(_, _)) => true,
+        (Decimal128(_, _), Decimal128(_, _)) => true,
+        (Decimal256(_, _), Decimal256(_, _)) => true,
+        (Decimal128(_, _), Decimal256(_, _)) => true,
+        (Decimal256(_, _), Decimal128(_, _)) => true,
         // signed numeric to decimal
-        (Null | Int8 | Int16 | Int32 | Int64 | Float32 | Float64, Decimal(_, _)) |
+        (Null | Int8 | Int16 | Int32 | Int64 | Float32 | Float64, Decimal128(_, _)) |
         // decimal to signed numeric
-        (Decimal(_, _), Null | Int8 | Int16 | Int32 | Int64 | Float32 | Float64)
+        (Decimal128(_, _), Null | Int8 | Int16 | Int32 | Int64 | Float32 | Float64)
         | (
             Null,
             Boolean
@@ -109,8 +118,8 @@ pub fn can_cast_types(from_type: &DataType, to_type: &DataType) -> bool {
             | Map(_, _)
             | Dictionary(_, _)
         ) => true,
-        (Decimal(_, _), _) => false,
-        (_, Decimal(_, _)) => false,
+        (Decimal128(_, _), _) => false,
+        (_, Decimal128(_, _)) => false,
         (Struct(_), _) => false,
         (_, Struct(_)) => false,
         (LargeList(list_from), LargeList(list_to)) => {
@@ -136,9 +145,25 @@ pub fn can_cast_types(from_type: &DataType, to_type: &DataType) -> bool {
 
         (Utf8, LargeUtf8) => true,
         (LargeUtf8, Utf8) => true,
-        (Utf8, Date32 | Date64 | Timestamp(TimeUnit::Nanosecond, None)) => true,
+        (Utf8,
+            Date32
+            | Date64
+            | Time32(TimeUnit::Second)
+            | Time32(TimeUnit::Millisecond)
+            | Time64(TimeUnit::Microsecond)
+            | Time64(TimeUnit::Nanosecond)
+            | Timestamp(TimeUnit::Nanosecond, None)
+        ) => true,
         (Utf8, _) => DataType::is_numeric(to_type),
-        (LargeUtf8, Date32 | Date64 | Timestamp(TimeUnit::Nanosecond, None)) => true,
+        (LargeUtf8,
+            Date32
+            | Date64
+            | Time32(TimeUnit::Second)
+            | Time32(TimeUnit::Millisecond)
+            | Time64(TimeUnit::Microsecond)
+            | Time64(TimeUnit::Nanosecond)
+            | Timestamp(TimeUnit::Nanosecond, None)
+        ) => true,
         (LargeUtf8, _) => DataType::is_numeric(to_type),
         (Timestamp(_, _), Utf8) | (Timestamp(_, _), LargeUtf8) => true,
         (Date32, Utf8) | (Date32, LargeUtf8) => true,
@@ -410,8 +435,19 @@ pub fn cast_with_options(
         return Ok(array.clone());
     }
     match (from_type, to_type) {
-        (Decimal(_, s1), Decimal(p2, s2)) => cast_decimal_to_decimal(array, s1, p2, s2),
-        (Decimal(_, scale), _) => {
+        (Decimal128(_, s1), Decimal128(p2, s2)) => {
+            cast_decimal_to_decimal::<16, 16>(array, s1, p2, s2)
+        }
+        (Decimal256(_, s1), Decimal256(p2, s2)) => {
+            cast_decimal_to_decimal::<32, 32>(array, s1, p2, s2)
+        }
+        (Decimal128(_, s1), Decimal256(p2, s2)) => {
+            cast_decimal_to_decimal::<16, 32>(array, s1, p2, s2)
+        }
+        (Decimal256(_, s1), Decimal128(p2, s2)) => {
+            cast_decimal_to_decimal::<32, 16>(array, s1, p2, s2)
+        }
+        (Decimal128(_, scale), _) => {
             // cast decimal to other type
             match to_type {
                 Int8 => {
@@ -439,7 +475,7 @@ pub fn cast_with_options(
                 ))),
             }
         }
-        (_, Decimal(precision, scale)) => {
+        (_, Decimal128(precision, scale)) => {
             // cast data to decimal
             match from_type {
                 // TODO now just support signed numeric to decimal, support decimal to numeric later
@@ -657,6 +693,18 @@ pub fn cast_with_options(
             Float64 => cast_string_to_numeric::<Float64Type, i32>(array, cast_options),
             Date32 => cast_string_to_date32::<i32>(&**array, cast_options),
             Date64 => cast_string_to_date64::<i32>(&**array, cast_options),
+            Time32(TimeUnit::Second) => {
+                cast_string_to_time32second::<i32>(&**array, cast_options)
+            }
+            Time32(TimeUnit::Millisecond) => {
+                cast_string_to_time32millisecond::<i32>(&**array, cast_options)
+            }
+            Time64(TimeUnit::Microsecond) => {
+                cast_string_to_time64microsecond::<i32>(&**array, cast_options)
+            }
+            Time64(TimeUnit::Nanosecond) => {
+                cast_string_to_time64nanosecond::<i32>(&**array, cast_options)
+            }
             Timestamp(TimeUnit::Nanosecond, None) => {
                 cast_string_to_timestamp_ns::<i32>(&**array, cast_options)
             }
@@ -791,6 +839,18 @@ pub fn cast_with_options(
             Float64 => cast_string_to_numeric::<Float64Type, i64>(array, cast_options),
             Date32 => cast_string_to_date32::<i64>(&**array, cast_options),
             Date64 => cast_string_to_date64::<i64>(&**array, cast_options),
+            Time32(TimeUnit::Second) => {
+                cast_string_to_time32second::<i64>(&**array, cast_options)
+            }
+            Time32(TimeUnit::Millisecond) => {
+                cast_string_to_time32millisecond::<i64>(&**array, cast_options)
+            }
+            Time64(TimeUnit::Microsecond) => {
+                cast_string_to_time64microsecond::<i64>(&**array, cast_options)
+            }
+            Time64(TimeUnit::Nanosecond) => {
+                cast_string_to_time64nanosecond::<i64>(&**array, cast_options)
+            }
             Timestamp(TimeUnit::Nanosecond, None) => {
                 cast_string_to_timestamp_ns::<i64>(&**array, cast_options)
             }
@@ -1204,48 +1264,124 @@ const fn time_unit_multiple(unit: &TimeUnit) -> i64 {
     }
 }
 
-/// Number of seconds in a day
-const SECONDS_IN_DAY: i64 = 86_400;
-/// Number of milliseconds in a second
-const MILLISECONDS: i64 = 1_000;
-/// Number of microseconds in a second
-const MICROSECONDS: i64 = 1_000_000;
-/// Number of nanoseconds in a second
-const NANOSECONDS: i64 = 1_000_000_000;
-/// Number of milliseconds in a day
-const MILLISECONDS_IN_DAY: i64 = SECONDS_IN_DAY * MILLISECONDS;
-/// Number of days between 0001-01-01 and 1970-01-01
-const EPOCH_DAYS_FROM_CE: i32 = 719_163;
-
 /// Cast one type of decimal array to another type of decimal array
-fn cast_decimal_to_decimal(
+fn cast_decimal_to_decimal<const BYTE_WIDTH1: usize, const BYTE_WIDTH2: usize>(
     array: &ArrayRef,
     input_scale: &usize,
     output_precision: &usize,
     output_scale: &usize,
 ) -> Result<ArrayRef> {
-    let array = array.as_any().downcast_ref::<Decimal128Array>().unwrap();
-
-    let output_array = if input_scale > output_scale {
+    if input_scale > output_scale {
         // For example, input_scale is 4 and output_scale is 3;
         // Original value is 11234_i128, and will be cast to 1123_i128.
         let div = 10_i128.pow((input_scale - output_scale) as u32);
-        array
-            .iter()
-            .map(|v| v.map(|v| v.as_i128() / div))
-            .collect::<Decimal128Array>()
+        if BYTE_WIDTH1 == 16 {
+            let array = array.as_any().downcast_ref::<Decimal128Array>().unwrap();
+            let iter = array.iter().map(|v| v.map(|v| v.as_i128() / div));
+            if BYTE_WIDTH2 == 16 {
+                let output_array = iter
+                    .collect::<Decimal128Array>()
+                    .with_precision_and_scale(*output_precision, *output_scale)?;
+
+                Ok(Arc::new(output_array))
+            } else {
+                let output_array = iter
+                    .map(|v| v.map(BigInt::from))
+                    .collect::<Decimal256Array>()
+                    .with_precision_and_scale(*output_precision, *output_scale)?;
+
+                Ok(Arc::new(output_array))
+            }
+        } else {
+            let array = array.as_any().downcast_ref::<Decimal256Array>().unwrap();
+            let iter = array.iter().map(|v| v.map(|v| v.to_big_int().div(div)));
+            if BYTE_WIDTH2 == 16 {
+                let values = iter
+                    .map(|v| {
+                        if v.is_none() {
+                            Ok(None)
+                        } else {
+                            v.as_ref().and_then(|v| v.to_i128())
+                                .ok_or_else(|| {
+                                    ArrowError::InvalidArgumentError(
+                                    format!("{:?} cannot be casted to 128-bit integer for Decimal128", v),
+                                )
+                                })
+                                .map(Some)
+                        }
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+
+                let output_array = values
+                    .into_iter()
+                    .collect::<Decimal128Array>()
+                    .with_precision_and_scale(*output_precision, *output_scale)?;
+
+                Ok(Arc::new(output_array))
+            } else {
+                let output_array = iter
+                    .collect::<Decimal256Array>()
+                    .with_precision_and_scale(*output_precision, *output_scale)?;
+
+                Ok(Arc::new(output_array))
+            }
+        }
     } else {
         // For example, input_scale is 3 and output_scale is 4;
         // Original value is 1123_i128, and will be cast to 11230_i128.
         let mul = 10_i128.pow((output_scale - input_scale) as u32);
-        array
-            .iter()
-            .map(|v| v.map(|v| v.as_i128() * mul))
-            .collect::<Decimal128Array>()
-    }
-    .with_precision_and_scale(*output_precision, *output_scale)?;
+        if BYTE_WIDTH1 == 16 {
+            let array = array.as_any().downcast_ref::<Decimal128Array>().unwrap();
+            let iter = array.iter().map(|v| v.map(|v| v.as_i128() * mul));
+            if BYTE_WIDTH2 == 16 {
+                let output_array = iter
+                    .collect::<Decimal128Array>()
+                    .with_precision_and_scale(*output_precision, *output_scale)?;
 
-    Ok(Arc::new(output_array))
+                Ok(Arc::new(output_array))
+            } else {
+                let output_array = iter
+                    .map(|v| v.map(BigInt::from))
+                    .collect::<Decimal256Array>()
+                    .with_precision_and_scale(*output_precision, *output_scale)?;
+
+                Ok(Arc::new(output_array))
+            }
+        } else {
+            let array = array.as_any().downcast_ref::<Decimal256Array>().unwrap();
+            let iter = array.iter().map(|v| v.map(|v| v.to_big_int().mul(mul)));
+            if BYTE_WIDTH2 == 16 {
+                let values = iter
+                    .map(|v| {
+                        if v.is_none() {
+                            Ok(None)
+                        } else {
+                            v.as_ref().and_then(|v| v.to_i128())
+                                .ok_or_else(|| {
+                                    ArrowError::InvalidArgumentError(
+                                    format!("{:?} cannot be casted to 128-bit integer for Decimal128", v),
+                                )
+                                })
+                                .map(Some)
+                        }
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+
+                let output_array = values
+                    .into_iter()
+                    .collect::<Decimal128Array>()
+                    .with_precision_and_scale(*output_precision, *output_scale)?;
+
+                Ok(Arc::new(output_array))
+            } else {
+                let output_array = iter
+                    .collect::<Decimal256Array>()
+                    .with_precision_and_scale(*output_precision, *output_scale)?;
+
+                Ok(Arc::new(output_array))
+            }
+        }
+    }
 }
 
 /// Cast an array by changing its array_data type to the desired type
@@ -1420,35 +1556,28 @@ where
     <T as ArrowPrimitiveType>::Native: lexical_core::FromLexical,
 {
     if cast_options.safe {
-        let iter = (0..from.len()).map(|i| {
-            if from.is_null(i) {
-                None
-            } else {
-                lexical_core::parse(from.value(i).as_bytes()).ok()
-            }
-        });
+        let iter = from
+            .iter()
+            .map(|v| v.and_then(|v| lexical_core::parse(v.as_bytes()).ok()));
         // Benefit:
         //     20% performance improvement
         // Soundness:
         //     The iterator is trustedLen because it comes from an `StringArray`.
         Ok(unsafe { PrimitiveArray::<T>::from_trusted_len_iter(iter) })
     } else {
-        let vec = (0..from.len())
-            .map(|i| {
-                if from.is_null(i) {
-                    Ok(None)
-                } else {
-                    let string = from.value(i);
-                    let result = lexical_core::parse(string.as_bytes());
-                    Some(result.map_err(|_| {
+        let vec = from
+            .iter()
+            .map(|v| {
+                v.map(|v| {
+                    lexical_core::parse(v.as_bytes()).map_err(|_| {
                         ArrowError::CastError(format!(
-                            "Cannot cast string '{}' to value of {} type",
-                            string,
-                            std::any::type_name::<T>()
+                            "Cannot cast string '{}' to value of {:?} type",
+                            v,
+                            T::DATA_TYPE,
                         ))
-                    }))
-                    .transpose()
-                }
+                    })
+                })
+                .transpose()
             })
             .collect::<Result<Vec<_>>>()?;
         // Benefit:
@@ -1471,16 +1600,12 @@ fn cast_string_to_date32<Offset: OffsetSizeTrait>(
         .unwrap();
 
     let array = if cast_options.safe {
-        let iter = (0..string_array.len()).map(|i| {
-            if string_array.is_null(i) {
-                None
-            } else {
-                string_array
-                    .value(i)
-                    .parse::<chrono::NaiveDate>()
+        let iter = string_array.iter().map(|v| {
+            v.and_then(|v| {
+                v.parse::<chrono::NaiveDate>()
                     .map(|date| date.num_days_from_ce() - EPOCH_DAYS_FROM_CE)
                     .ok()
-            }
+            })
         });
 
         // Benefit:
@@ -1489,25 +1614,21 @@ fn cast_string_to_date32<Offset: OffsetSizeTrait>(
         //     The iterator is trustedLen because it comes from an `StringArray`.
         unsafe { Date32Array::from_trusted_len_iter(iter) }
     } else {
-        let vec = (0..string_array.len())
-            .map(|i| {
-                if string_array.is_null(i) {
-                    Ok(None)
-                } else {
-                    let string = string_array
-                        .value(i);
-
-                    let result = string
-                        .parse::<chrono::NaiveDate>()
-                        .map(|date| date.num_days_from_ce() - EPOCH_DAYS_FROM_CE);
-
-                    Some(result.map_err(|_| {
-                        ArrowError::CastError(
-                            format!("Cannot cast string '{}' to value of arrow::datatypes::types::Date32Type type", string),
-                        )
-                    }))
-                        .transpose()
-                }
+        let vec = string_array
+            .iter()
+            .map(|v| {
+                v.map(|v| {
+                    v.parse::<chrono::NaiveDate>()
+                        .map(|date| date.num_days_from_ce() - EPOCH_DAYS_FROM_CE)
+                        .map_err(|_| {
+                            ArrowError::CastError(format!(
+                                "Cannot cast string '{}' to value of {:?} type",
+                                v,
+                                DataType::Date32
+                            ))
+                        })
+                })
+                .transpose()
             })
             .collect::<Result<Vec<Option<i32>>>>()?;
 
@@ -1532,16 +1653,12 @@ fn cast_string_to_date64<Offset: OffsetSizeTrait>(
         .unwrap();
 
     let array = if cast_options.safe {
-        let iter = (0..string_array.len()).map(|i| {
-            if string_array.is_null(i) {
-                None
-            } else {
-                string_array
-                    .value(i)
-                    .parse::<chrono::NaiveDateTime>()
+        let iter = string_array.iter().map(|v| {
+            v.and_then(|v| {
+                v.parse::<chrono::NaiveDateTime>()
                     .map(|datetime| datetime.timestamp_millis())
                     .ok()
-            }
+            })
         });
 
         // Benefit:
@@ -1550,25 +1667,21 @@ fn cast_string_to_date64<Offset: OffsetSizeTrait>(
         //     The iterator is trustedLen because it comes from an `StringArray`.
         unsafe { Date64Array::from_trusted_len_iter(iter) }
     } else {
-        let vec = (0..string_array.len())
-            .map(|i| {
-                if string_array.is_null(i) {
-                    Ok(None)
-                } else {
-                    let string = string_array
-                        .value(i);
-
-                    let result = string
-                        .parse::<chrono::NaiveDateTime>()
-                        .map(|datetime| datetime.timestamp_millis());
-
-                    Some(result.map_err(|_| {
-                        ArrowError::CastError(
-                            format!("Cannot cast string '{}' to value of arrow::datatypes::types::Date64Type type", string),
-                        )
-                    }))
-                        .transpose()
-                }
+        let vec = string_array
+            .iter()
+            .map(|v| {
+                v.map(|v| {
+                    v.parse::<chrono::NaiveDateTime>()
+                        .map(|datetime| datetime.timestamp_millis())
+                        .map_err(|_| {
+                            ArrowError::CastError(format!(
+                                "Cannot cast string '{}' to value of {:?} type",
+                                v,
+                                DataType::Date64
+                            ))
+                        })
+                })
+                .transpose()
             })
             .collect::<Result<Vec<Option<i64>>>>()?;
 
@@ -1577,6 +1690,262 @@ fn cast_string_to_date64<Offset: OffsetSizeTrait>(
         // Soundness:
         //     The iterator is trustedLen because it comes from an `StringArray`.
         unsafe { Date64Array::from_trusted_len_iter(vec.iter()) }
+    };
+
+    Ok(Arc::new(array) as ArrayRef)
+}
+
+/// Casts generic string arrays to `Time32SecondArray`
+fn cast_string_to_time32second<Offset: OffsetSizeTrait>(
+    array: &dyn Array,
+    cast_options: &CastOptions,
+) -> Result<ArrayRef> {
+    /// The number of nanoseconds per millisecond.
+    const NANOS_PER_SEC: u32 = 1_000_000_000;
+
+    let string_array = array
+        .as_any()
+        .downcast_ref::<GenericStringArray<Offset>>()
+        .unwrap();
+
+    let array = if cast_options.safe {
+        let iter = string_array.iter().map(|v| {
+            v.and_then(|v| {
+                v.parse::<chrono::NaiveTime>()
+                    .map(|time| {
+                        (time.num_seconds_from_midnight()
+                            + time.nanosecond() / NANOS_PER_SEC)
+                            as i32
+                    })
+                    .ok()
+            })
+        });
+
+        // Benefit:
+        //     20% performance improvement
+        // Soundness:
+        //     The iterator is trustedLen because it comes from an `StringArray`.
+        unsafe { Time32SecondArray::from_trusted_len_iter(iter) }
+    } else {
+        let vec = string_array
+            .iter()
+            .map(|v| {
+                v.map(|v| {
+                    v.parse::<chrono::NaiveTime>()
+                        .map(|time| {
+                            (time.num_seconds_from_midnight()
+                                + time.nanosecond() / NANOS_PER_SEC)
+                                as i32
+                        })
+                        .map_err(|_| {
+                            ArrowError::CastError(format!(
+                                "Cannot cast string '{}' to value of {:?} type",
+                                v,
+                                DataType::Time32(TimeUnit::Second)
+                            ))
+                        })
+                })
+                .transpose()
+            })
+            .collect::<Result<Vec<Option<i32>>>>()?;
+
+        // Benefit:
+        //     20% performance improvement
+        // Soundness:
+        //     The iterator is trustedLen because it comes from an `StringArray`.
+        unsafe { Time32SecondArray::from_trusted_len_iter(vec.iter()) }
+    };
+
+    Ok(Arc::new(array) as ArrayRef)
+}
+
+/// Casts generic string arrays to `Time32MillisecondArray`
+fn cast_string_to_time32millisecond<Offset: OffsetSizeTrait>(
+    array: &dyn Array,
+    cast_options: &CastOptions,
+) -> Result<ArrayRef> {
+    /// The number of nanoseconds per millisecond.
+    const NANOS_PER_MILLI: u32 = 1_000_000;
+    /// The number of milliseconds per second.
+    const MILLIS_PER_SEC: u32 = 1_000;
+
+    let string_array = array
+        .as_any()
+        .downcast_ref::<GenericStringArray<Offset>>()
+        .unwrap();
+
+    let array = if cast_options.safe {
+        let iter = string_array.iter().map(|v| {
+            v.and_then(|v| {
+                v.parse::<chrono::NaiveTime>()
+                    .map(|time| {
+                        (time.num_seconds_from_midnight() * MILLIS_PER_SEC
+                            + time.nanosecond() / NANOS_PER_MILLI)
+                            as i32
+                    })
+                    .ok()
+            })
+        });
+
+        // Benefit:
+        //     20% performance improvement
+        // Soundness:
+        //     The iterator is trustedLen because it comes from an `StringArray`.
+        unsafe { Time32MillisecondArray::from_trusted_len_iter(iter) }
+    } else {
+        let vec = string_array
+            .iter()
+            .map(|v| {
+                v.map(|v| {
+                    v.parse::<chrono::NaiveTime>()
+                        .map(|time| {
+                            (time.num_seconds_from_midnight() * MILLIS_PER_SEC
+                                + time.nanosecond() / NANOS_PER_MILLI)
+                                as i32
+                        })
+                        .map_err(|_| {
+                            ArrowError::CastError(format!(
+                                "Cannot cast string '{}' to value of {:?} type",
+                                v,
+                                DataType::Time32(TimeUnit::Millisecond)
+                            ))
+                        })
+                })
+                .transpose()
+            })
+            .collect::<Result<Vec<Option<i32>>>>()?;
+
+        // Benefit:
+        //     20% performance improvement
+        // Soundness:
+        //     The iterator is trustedLen because it comes from an `StringArray`.
+        unsafe { Time32MillisecondArray::from_trusted_len_iter(vec.iter()) }
+    };
+
+    Ok(Arc::new(array) as ArrayRef)
+}
+
+/// Casts generic string arrays to `Time64MicrosecondArray`
+fn cast_string_to_time64microsecond<Offset: OffsetSizeTrait>(
+    array: &dyn Array,
+    cast_options: &CastOptions,
+) -> Result<ArrayRef> {
+    /// The number of nanoseconds per microsecond.
+    const NANOS_PER_MICRO: i64 = 1_000;
+    /// The number of microseconds per second.
+    const MICROS_PER_SEC: i64 = 1_000_000;
+
+    let string_array = array
+        .as_any()
+        .downcast_ref::<GenericStringArray<Offset>>()
+        .unwrap();
+
+    let array = if cast_options.safe {
+        let iter = string_array.iter().map(|v| {
+            v.and_then(|v| {
+                v.parse::<chrono::NaiveTime>()
+                    .map(|time| {
+                        time.num_seconds_from_midnight() as i64 * MICROS_PER_SEC
+                            + time.nanosecond() as i64 / NANOS_PER_MICRO
+                    })
+                    .ok()
+            })
+        });
+
+        // Benefit:
+        //     20% performance improvement
+        // Soundness:
+        //     The iterator is trustedLen because it comes from an `StringArray`.
+        unsafe { Time64MicrosecondArray::from_trusted_len_iter(iter) }
+    } else {
+        let vec = string_array
+            .iter()
+            .map(|v| {
+                v.map(|v| {
+                    v.parse::<chrono::NaiveTime>()
+                        .map(|time| {
+                            time.num_seconds_from_midnight() as i64 * MICROS_PER_SEC
+                                + time.nanosecond() as i64 / NANOS_PER_MICRO
+                        })
+                        .map_err(|_| {
+                            ArrowError::CastError(format!(
+                                "Cannot cast string '{}' to value of {:?} type",
+                                v,
+                                DataType::Time64(TimeUnit::Microsecond)
+                            ))
+                        })
+                })
+                .transpose()
+            })
+            .collect::<Result<Vec<Option<i64>>>>()?;
+
+        // Benefit:
+        //     20% performance improvement
+        // Soundness:
+        //     The iterator is trustedLen because it comes from an `StringArray`.
+        unsafe { Time64MicrosecondArray::from_trusted_len_iter(vec.iter()) }
+    };
+
+    Ok(Arc::new(array) as ArrayRef)
+}
+
+/// Casts generic string arrays to `Time64NanosecondArray`
+fn cast_string_to_time64nanosecond<Offset: OffsetSizeTrait>(
+    array: &dyn Array,
+    cast_options: &CastOptions,
+) -> Result<ArrayRef> {
+    /// The number of nanoseconds per second.
+    const NANOS_PER_SEC: i64 = 1_000_000_000;
+
+    let string_array = array
+        .as_any()
+        .downcast_ref::<GenericStringArray<Offset>>()
+        .unwrap();
+
+    let array = if cast_options.safe {
+        let iter = string_array.iter().map(|v| {
+            v.and_then(|v| {
+                v.parse::<chrono::NaiveTime>()
+                    .map(|time| {
+                        time.num_seconds_from_midnight() as i64 * NANOS_PER_SEC
+                            + time.nanosecond() as i64
+                    })
+                    .ok()
+            })
+        });
+
+        // Benefit:
+        //     20% performance improvement
+        // Soundness:
+        //     The iterator is trustedLen because it comes from an `StringArray`.
+        unsafe { Time64NanosecondArray::from_trusted_len_iter(iter) }
+    } else {
+        let vec = string_array
+            .iter()
+            .map(|v| {
+                v.map(|v| {
+                    v.parse::<chrono::NaiveTime>()
+                        .map(|time| {
+                            time.num_seconds_from_midnight() as i64 * NANOS_PER_SEC
+                                + time.nanosecond() as i64
+                        })
+                        .map_err(|_| {
+                            ArrowError::CastError(format!(
+                                "Cannot cast string '{}' to value of {:?} type",
+                                v,
+                                DataType::Time64(TimeUnit::Nanosecond)
+                            ))
+                        })
+                })
+                .transpose()
+            })
+            .collect::<Result<Vec<Option<i64>>>>()?;
+
+        // Benefit:
+        //     20% performance improvement
+        // Soundness:
+        //     The iterator is trustedLen because it comes from an `StringArray`.
+        unsafe { Time64NanosecondArray::from_trusted_len_iter(vec.iter()) }
     };
 
     Ok(Arc::new(array) as ArrayRef)
@@ -1593,28 +1962,18 @@ fn cast_string_to_timestamp_ns<Offset: OffsetSizeTrait>(
         .unwrap();
 
     let array = if cast_options.safe {
-        let iter = (0..string_array.len()).map(|i| {
-            if string_array.is_null(i) {
-                None
-            } else {
-                string_to_timestamp_nanos(string_array.value(i)).ok()
-            }
-        });
+        let iter = string_array
+            .iter()
+            .map(|v| v.and_then(|v| string_to_timestamp_nanos(v).ok()));
         // Benefit:
         //     20% performance improvement
         // Soundness:
         //     The iterator is trustedLen because it comes from an `StringArray`.
         unsafe { TimestampNanosecondArray::from_trusted_len_iter(iter) }
     } else {
-        let vec = (0..string_array.len())
-            .map(|i| {
-                if string_array.is_null(i) {
-                    Ok(None)
-                } else {
-                    let result = string_to_timestamp_nanos(string_array.value(i));
-                    Some(result).transpose()
-                }
-            })
+        let vec = string_array
+            .iter()
+            .map(|v| v.map(string_to_timestamp_nanos).transpose())
             .collect::<Result<Vec<Option<i64>>>>()?;
 
         // Benefit:
@@ -2163,8 +2522,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::array::BasicDecimalArray;
-    use crate::util::decimal::Decimal128;
+    use crate::datatypes::TimeUnit;
+    use crate::util::decimal::{Decimal128, Decimal256};
     use crate::{buffer::Buffer, util::display::array_value_to_string};
 
     macro_rules! generate_cast_test_case {
@@ -2203,10 +2562,21 @@ mod tests {
             .with_precision_and_scale(precision, scale)
     }
 
+    fn create_decimal256_array(
+        array: Vec<Option<BigInt>>,
+        precision: usize,
+        scale: usize,
+    ) -> Result<Decimal256Array> {
+        array
+            .into_iter()
+            .collect::<Decimal256Array>()
+            .with_precision_and_scale(precision, scale)
+    }
+
     #[test]
-    fn test_cast_decimal_to_decimal() {
-        let input_type = DataType::Decimal(20, 3);
-        let output_type = DataType::Decimal(20, 4);
+    fn test_cast_decimal128_to_decimal128() {
+        let input_type = DataType::Decimal128(20, 3);
+        let output_type = DataType::Decimal128(20, 4);
         assert!(can_cast_types(&input_type, &output_type));
         let array = vec![Some(1123456), Some(2123456), Some(3123456), None];
         let input_decimal_array = create_decimal_array(&array, 20, 3).unwrap();
@@ -2226,15 +2596,106 @@ mod tests {
         let array = vec![Some(123456), None];
         let input_decimal_array = create_decimal_array(&array, 10, 0).unwrap();
         let array = Arc::new(input_decimal_array) as ArrayRef;
-        let result = cast(&array, &DataType::Decimal(2, 2));
+        let result = cast(&array, &DataType::Decimal128(2, 2));
         assert!(result.is_err());
-        assert_eq!("Invalid argument error: 12345600 is too large to store in a Decimal of precision 2. Max is 99",
+        assert_eq!("Invalid argument error: 12345600 is too large to store in a Decimal128 of precision 2. Max is 99",
                    result.unwrap_err().to_string());
     }
 
     #[test]
+    fn test_cast_decimal128_to_decimal256() {
+        let input_type = DataType::Decimal128(20, 3);
+        let output_type = DataType::Decimal256(20, 4);
+        assert!(can_cast_types(&input_type, &output_type));
+        let array = vec![Some(1123456), Some(2123456), Some(3123456), None];
+        let input_decimal_array = create_decimal_array(&array, 20, 3).unwrap();
+        let array = Arc::new(input_decimal_array) as ArrayRef;
+        generate_cast_test_case!(
+            &array,
+            Decimal256Array,
+            &output_type,
+            vec![
+                Some(
+                    Decimal256::from_big_int(&BigInt::from(11234560_i128), 20, 4)
+                        .unwrap()
+                ),
+                Some(
+                    Decimal256::from_big_int(&BigInt::from(21234560_i128), 20, 4)
+                        .unwrap()
+                ),
+                Some(
+                    Decimal256::from_big_int(&BigInt::from(31234560_i128), 20, 4)
+                        .unwrap()
+                ),
+                None
+            ]
+        );
+    }
+
+    #[test]
+    fn test_cast_decimal256_to_decimal128() {
+        let input_type = DataType::Decimal256(20, 3);
+        let output_type = DataType::Decimal128(20, 4);
+        assert!(can_cast_types(&input_type, &output_type));
+        let array = vec![
+            Some(BigInt::from(1123456)),
+            Some(BigInt::from(2123456)),
+            Some(BigInt::from(3123456)),
+            None,
+        ];
+        let input_decimal_array = create_decimal256_array(array, 20, 3).unwrap();
+        let array = Arc::new(input_decimal_array) as ArrayRef;
+        generate_cast_test_case!(
+            &array,
+            Decimal128Array,
+            &output_type,
+            vec![
+                Some(Decimal128::new_from_i128(20, 4, 11234560_i128)),
+                Some(Decimal128::new_from_i128(20, 4, 21234560_i128)),
+                Some(Decimal128::new_from_i128(20, 4, 31234560_i128)),
+                None
+            ]
+        );
+    }
+
+    #[test]
+    fn test_cast_decimal256_to_decimal256() {
+        let input_type = DataType::Decimal256(20, 3);
+        let output_type = DataType::Decimal256(20, 4);
+        assert!(can_cast_types(&input_type, &output_type));
+        let array = vec![
+            Some(BigInt::from(1123456)),
+            Some(BigInt::from(2123456)),
+            Some(BigInt::from(3123456)),
+            None,
+        ];
+        let input_decimal_array = create_decimal256_array(array, 20, 3).unwrap();
+        let array = Arc::new(input_decimal_array) as ArrayRef;
+        generate_cast_test_case!(
+            &array,
+            Decimal256Array,
+            &output_type,
+            vec![
+                Some(
+                    Decimal256::from_big_int(&BigInt::from(11234560_i128), 20, 4)
+                        .unwrap()
+                ),
+                Some(
+                    Decimal256::from_big_int(&BigInt::from(21234560_i128), 20, 4)
+                        .unwrap()
+                ),
+                Some(
+                    Decimal256::from_big_int(&BigInt::from(31234560_i128), 20, 4)
+                        .unwrap()
+                ),
+                None
+            ]
+        );
+    }
+
+    #[test]
     fn test_cast_decimal_to_numeric() {
-        let decimal_type = DataType::Decimal(38, 2);
+        let decimal_type = DataType::Decimal128(38, 2);
         // negative test
         assert!(!can_cast_types(&decimal_type, &DataType::UInt8));
         let value_array: Vec<Option<i128>> =
@@ -2355,7 +2816,7 @@ mod tests {
     #[test]
     fn test_cast_numeric_to_decimal() {
         // test negative cast type
-        let decimal_type = DataType::Decimal(38, 6);
+        let decimal_type = DataType::Decimal128(38, 6);
         assert!(!can_cast_types(&DataType::UInt64, &decimal_type));
 
         // i8, i16, i32, i64
@@ -2408,9 +2869,9 @@ mod tests {
         // the 100 will be converted to 1000_i128, but it is out of range for max value in the precision 3.
         let array = Int8Array::from(vec![1, 2, 3, 4, 100]);
         let array = Arc::new(array) as ArrayRef;
-        let casted_array = cast(&array, &DataType::Decimal(3, 1));
+        let casted_array = cast(&array, &DataType::Decimal128(3, 1));
         assert!(casted_array.is_err());
-        assert_eq!("Invalid argument error: 1000 is too large to store in a Decimal of precision 3. Max is 999", casted_array.unwrap_err().to_string());
+        assert_eq!("Invalid argument error: 1000 is too large to store in a Decimal128 of precision 3. Max is 999", casted_array.unwrap_err().to_string());
 
         // test f32 to decimal type
         let array = Float32Array::from(vec![
@@ -2623,9 +3084,13 @@ mod tests {
         match result {
             Ok(_) => panic!("expected error"),
             Err(e) => {
-                assert!(e.to_string().contains(
-                    "Cast error: Cannot cast string 'seven' to value of arrow::datatypes::types::Int32Type type"
-                ))
+                assert!(
+                    e.to_string().contains(
+                        "Cast error: Cannot cast string 'seven' to value of Int32 type",
+                    ),
+                    "Error: {}",
+                    e
+                )
             }
         }
     }
@@ -2819,8 +3284,8 @@ mod tests {
             None,
         ])) as ArrayRef;
         for array in &[a1, a2] {
-            let b =
-                cast(array, &DataType::Timestamp(TimeUnit::Nanosecond, None)).unwrap();
+            let to_type = DataType::Timestamp(TimeUnit::Nanosecond, None);
+            let b = cast(array, &to_type).unwrap();
             let c = b
                 .as_any()
                 .downcast_ref::<TimestampNanosecondArray>()
@@ -2828,6 +3293,13 @@ mod tests {
             assert_eq!(1599566400000000000, c.value(0));
             assert!(c.is_null(1));
             assert!(c.is_null(2));
+
+            let options = CastOptions { safe: false };
+            let err = cast_with_options(array, &to_type, &options).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                "Cast error: Error parsing 'Not a valid date' as timestamp"
+            );
         }
     }
 
@@ -2844,11 +3316,132 @@ mod tests {
             None,
         ])) as ArrayRef;
         for array in &[a1, a2] {
-            let b = cast(array, &DataType::Date32).unwrap();
+            let to_type = DataType::Date32;
+            let b = cast(array, &to_type).unwrap();
             let c = b.as_any().downcast_ref::<Date32Array>().unwrap();
             assert_eq!(17890, c.value(0));
             assert!(c.is_null(1));
             assert!(c.is_null(2));
+
+            let options = CastOptions { safe: false };
+            let err = cast_with_options(array, &to_type, &options).unwrap_err();
+            assert_eq!(err.to_string(), "Cast error: Cannot cast string 'Not a valid date' to value of Date32 type");
+        }
+    }
+
+    #[test]
+    fn test_cast_string_to_time32second() {
+        let a1 = Arc::new(StringArray::from(vec![
+            Some("08:08:35.091323414"),
+            Some("08:08:60.091323414"), // leap second
+            Some("08:08:61.091323414"), // not valid
+            Some("Not a valid time"),
+            None,
+        ])) as ArrayRef;
+        let a2 = Arc::new(LargeStringArray::from(vec![
+            Some("08:08:35.091323414"),
+            Some("08:08:60.091323414"), // leap second
+            Some("08:08:61.091323414"), // not valid
+            Some("Not a valid time"),
+            None,
+        ])) as ArrayRef;
+        for array in &[a1, a2] {
+            let to_type = DataType::Time32(TimeUnit::Second);
+            let b = cast(array, &to_type).unwrap();
+            let c = b.as_any().downcast_ref::<Time32SecondArray>().unwrap();
+            assert_eq!(29315, c.value(0));
+            assert_eq!(29340, c.value(1));
+            assert!(c.is_null(2));
+            assert!(c.is_null(3));
+            assert!(c.is_null(4));
+
+            let options = CastOptions { safe: false };
+            let err = cast_with_options(array, &to_type, &options).unwrap_err();
+            assert_eq!(err.to_string(), "Cast error: Cannot cast string '08:08:61.091323414' to value of Time32(Second) type");
+        }
+    }
+
+    #[test]
+    fn test_cast_string_to_time32millisecond() {
+        let a1 = Arc::new(StringArray::from(vec![
+            Some("08:08:35.091323414"),
+            Some("08:08:60.091323414"), // leap second
+            Some("08:08:61.091323414"), // not valid
+            Some("Not a valid time"),
+            None,
+        ])) as ArrayRef;
+        let a2 = Arc::new(LargeStringArray::from(vec![
+            Some("08:08:35.091323414"),
+            Some("08:08:60.091323414"), // leap second
+            Some("08:08:61.091323414"), // not valid
+            Some("Not a valid time"),
+            None,
+        ])) as ArrayRef;
+        for array in &[a1, a2] {
+            let to_type = DataType::Time32(TimeUnit::Millisecond);
+            let b = cast(array, &to_type).unwrap();
+            let c = b.as_any().downcast_ref::<Time32MillisecondArray>().unwrap();
+            assert_eq!(29315091, c.value(0));
+            assert_eq!(29340091, c.value(1));
+            assert!(c.is_null(2));
+            assert!(c.is_null(3));
+            assert!(c.is_null(4));
+
+            let options = CastOptions { safe: false };
+            let err = cast_with_options(array, &to_type, &options).unwrap_err();
+            assert_eq!(err.to_string(), "Cast error: Cannot cast string '08:08:61.091323414' to value of Time32(Millisecond) type");
+        }
+    }
+
+    #[test]
+    fn test_cast_string_to_time64microsecond() {
+        let a1 = Arc::new(StringArray::from(vec![
+            Some("08:08:35.091323414"),
+            Some("Not a valid time"),
+            None,
+        ])) as ArrayRef;
+        let a2 = Arc::new(LargeStringArray::from(vec![
+            Some("08:08:35.091323414"),
+            Some("Not a valid time"),
+            None,
+        ])) as ArrayRef;
+        for array in &[a1, a2] {
+            let to_type = DataType::Time64(TimeUnit::Microsecond);
+            let b = cast(array, &to_type).unwrap();
+            let c = b.as_any().downcast_ref::<Time64MicrosecondArray>().unwrap();
+            assert_eq!(29315091323, c.value(0));
+            assert!(c.is_null(1));
+            assert!(c.is_null(2));
+
+            let options = CastOptions { safe: false };
+            let err = cast_with_options(array, &to_type, &options).unwrap_err();
+            assert_eq!(err.to_string(), "Cast error: Cannot cast string 'Not a valid time' to value of Time64(Microsecond) type");
+        }
+    }
+
+    #[test]
+    fn test_cast_string_to_time64nanosecond() {
+        let a1 = Arc::new(StringArray::from(vec![
+            Some("08:08:35.091323414"),
+            Some("Not a valid time"),
+            None,
+        ])) as ArrayRef;
+        let a2 = Arc::new(LargeStringArray::from(vec![
+            Some("08:08:35.091323414"),
+            Some("Not a valid time"),
+            None,
+        ])) as ArrayRef;
+        for array in &[a1, a2] {
+            let to_type = DataType::Time64(TimeUnit::Nanosecond);
+            let b = cast(array, &to_type).unwrap();
+            let c = b.as_any().downcast_ref::<Time64NanosecondArray>().unwrap();
+            assert_eq!(29315091323414, c.value(0));
+            assert!(c.is_null(1));
+            assert!(c.is_null(2));
+
+            let options = CastOptions { safe: false };
+            let err = cast_with_options(array, &to_type, &options).unwrap_err();
+            assert_eq!(err.to_string(), "Cast error: Cannot cast string 'Not a valid time' to value of Time64(Nanosecond) type");
         }
     }
 
@@ -2865,11 +3458,16 @@ mod tests {
             None,
         ])) as ArrayRef;
         for array in &[a1, a2] {
-            let b = cast(array, &DataType::Date64).unwrap();
+            let to_type = DataType::Date64;
+            let b = cast(array, &to_type).unwrap();
             let c = b.as_any().downcast_ref::<Date64Array>().unwrap();
             assert_eq!(1599566400000, c.value(0));
             assert!(c.is_null(1));
             assert!(c.is_null(2));
+
+            let options = CastOptions { safe: false };
+            let err = cast_with_options(array, &to_type, &options).unwrap_err();
+            assert_eq!(err.to_string(), "Cast error: Cannot cast string 'Not a valid date' to value of Date64 type");
         }
     }
 
@@ -4282,7 +4880,7 @@ mod tests {
 
     #[test]
     fn test_cast_null_array_to_from_decimal_array() {
-        let data_type = DataType::Decimal(12, 4);
+        let data_type = DataType::Decimal128(12, 4);
         let array = new_null_array(&DataType::Null, 4);
         assert_eq!(array.data_type(), &DataType::Null);
         let cast_array = cast(&array, &data_type).expect("cast failed");
@@ -4804,7 +5402,7 @@ mod tests {
             Dictionary(Box::new(DataType::Int8), Box::new(DataType::Int32)),
             Dictionary(Box::new(DataType::Int16), Box::new(DataType::Utf8)),
             Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8)),
-            Decimal(38, 0),
+            Decimal128(38, 0),
         ]
     }
 

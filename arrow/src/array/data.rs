@@ -19,8 +19,8 @@
 //! common attributes and operations for Arrow array.
 
 use crate::datatypes::{
-    validate_decimal256_precision, validate_decimal_precision, DataType, IntervalUnit,
-    UnionMode,
+    validate_decimal256_precision_with_lt_bytes, validate_decimal_precision, DataType,
+    IntervalUnit, UnionMode,
 };
 use crate::error::{ArrowError, Result};
 use crate::util::bit_iterator::BitSliceIterator;
@@ -30,7 +30,6 @@ use crate::{
     util::bit_util,
 };
 use half::f16;
-use num::BigInt;
 use std::convert::TryInto;
 use std::mem;
 use std::ops::Range;
@@ -209,7 +208,7 @@ pub(crate) fn new_buffers(data_type: &DataType, capacity: usize) -> [MutableBuff
         DataType::FixedSizeList(_, _) | DataType::Struct(_) => {
             [empty_buffer, MutableBuffer::new(0)]
         }
-        DataType::Decimal(_, _) | DataType::Decimal256(_, _) => [
+        DataType::Decimal128(_, _) | DataType::Decimal256(_, _) => [
             MutableBuffer::new(capacity * mem::size_of::<u8>()),
             empty_buffer,
         ],
@@ -396,18 +395,24 @@ impl ArrayData {
     /// panic's if the new DataType is not compatible with the
     /// existing type.
     ///
-    /// Note: currently only changing a [DataType::Decimal]s precision
-    /// and scale are supported
+    /// Note: currently only changing a [DataType::Decimal128]s or
+    /// [DataType::Decimal256]s precision and scale are supported
     #[inline]
     pub(crate) fn with_data_type(mut self, new_data_type: DataType) -> Self {
-        assert!(
-            matches!(self.data_type, DataType::Decimal(_, _)),
-            "only DecimalType is supported for existing type"
-        );
-        assert!(
-            matches!(new_data_type, DataType::Decimal(_, _)),
-            "only DecimalType is supported for new datatype"
-        );
+        if matches!(self.data_type, DataType::Decimal128(_, _)) {
+            assert!(
+                matches!(new_data_type, DataType::Decimal128(_, _)),
+                "only 128-bit DecimalType is supported for new datatype"
+            );
+        } else if matches!(self.data_type, DataType::Decimal256(_, _)) {
+            assert!(
+                matches!(new_data_type, DataType::Decimal256(_, _)),
+                "only 256-bit DecimalType is supported for new datatype"
+            );
+        } else {
+            panic!("only DecimalType is supported.")
+        }
+
         self.data_type = new_data_type;
         self
     }
@@ -598,7 +603,7 @@ impl ArrayData {
             | DataType::LargeBinary
             | DataType::Interval(_)
             | DataType::FixedSizeBinary(_)
-            | DataType::Decimal(_, _)
+            | DataType::Decimal128(_, _)
             | DataType::Decimal256(_, _) => vec![],
             DataType::List(field) => {
                 vec![Self::new_empty(field.data_type())]
@@ -1031,7 +1036,7 @@ impl ArrayData {
 
     pub fn validate_values(&self) -> Result<()> {
         match &self.data_type {
-            DataType::Decimal(p, _) => {
+            DataType::Decimal128(p, _) => {
                 let values_buffer: &[i128] = self.typed_buffer(0, self.len)?;
                 for value in values_buffer {
                     validate_decimal_precision(*value, *p)?;
@@ -1043,9 +1048,7 @@ impl ArrayData {
                 for pos in 0..self.len() {
                     let offset = pos * 32;
                     let raw_bytes = &values[offset..offset + 32];
-                    let integer = BigInt::from_signed_bytes_le(raw_bytes);
-                    let value_str = integer.to_string();
-                    validate_decimal256_precision(&value_str, *p)?;
+                    validate_decimal256_precision_with_lt_bytes(raw_bytes, *p)?;
                 }
                 Ok(())
             }
@@ -1361,7 +1364,7 @@ pub(crate) fn layout(data_type: &DataType) -> DataTypeLayout {
             }
         }
         DataType::Dictionary(key_type, _value_type) => layout(key_type),
-        DataType::Decimal(_, _) => {
+        DataType::Decimal128(_, _) => {
             // Decimals are always some fixed width; The rust implementation
             // always uses 16 bytes / size of i128
             DataTypeLayout::new_fixed_width(size_of::<i128>())
@@ -2822,11 +2825,7 @@ mod tests {
         let byte_width = 16;
         let mut fixed_size_builder =
             FixedSizeListBuilder::new(values_builder, byte_width);
-        let value_as_bytes = Decimal128Builder::from_i128_to_fixed_size_bytes(
-            123456,
-            fixed_size_builder.value_length() as usize,
-        )
-        .unwrap();
+        let value_as_bytes = 123456_i128.to_le_bytes();
         fixed_size_builder
             .values()
             .append_slice(value_as_bytes.as_slice());
@@ -2834,14 +2833,14 @@ mod tests {
         let fixed_size_array = fixed_size_builder.finish();
 
         // Build ArrayData for Decimal
-        let builder = ArrayData::builder(DataType::Decimal(5, 3))
+        let builder = ArrayData::builder(DataType::Decimal128(5, 3))
             .len(fixed_size_array.len())
             .add_buffer(fixed_size_array.data_ref().child_data()[0].buffers()[0].clone());
         let array_data = unsafe { builder.build_unchecked() };
         let validation_result = array_data.validate_full();
         let error = validation_result.unwrap_err();
         assert_eq!(
-            "Invalid argument error: 123456 is too large to store in a Decimal of precision 5. Max is 99999",
+            "Invalid argument error: 123456 is too large to store in a Decimal128 of precision 5. Max is 99999",
             error.to_string()
         );
     }

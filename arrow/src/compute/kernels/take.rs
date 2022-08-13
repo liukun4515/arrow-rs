@@ -19,8 +19,6 @@
 
 use std::{ops::AddAssign, sync::Arc};
 
-use crate::array::BasicDecimalArray;
-
 use crate::buffer::{Buffer, MutableBuffer};
 use crate::compute::util::{
     take_value_indices_from_fixed_size_list, take_value_indices_from_list,
@@ -148,7 +146,7 @@ where
             let values = values.as_any().downcast_ref::<BooleanArray>().unwrap();
             Ok(Arc::new(take_boolean(values, indices)?))
         }
-        DataType::Decimal(_, _) => {
+        DataType::Decimal128(_, _) => {
             let decimal_values =
                 values.as_any().downcast_ref::<Decimal128Array>().unwrap();
             Ok(Arc::new(take_decimal128(decimal_values, indices)?))
@@ -614,23 +612,41 @@ where
     let mut output_buffer = MutableBuffer::new_null(len);
     let output_slice = output_buffer.as_slice_mut();
 
-    indices
-        .iter()
-        .enumerate()
-        .try_for_each::<_, Result<()>>(|(i, index)| {
-            if let Some(index) = index {
-                let index = ToPrimitive::to_usize(&index).ok_or_else(|| {
+    let indices_has_nulls = indices.null_count() > 0;
+
+    if indices_has_nulls {
+        indices
+            .iter()
+            .enumerate()
+            .try_for_each::<_, Result<()>>(|(i, index)| {
+                if let Some(index) = index {
+                    let index = ToPrimitive::to_usize(&index).ok_or_else(|| {
+                        ArrowError::ComputeError("Cast to usize failed".to_string())
+                    })?;
+
+                    if bit_util::get_bit(values_slice, values_offset + index) {
+                        bit_util::set_bit(output_slice, i);
+                    }
+                }
+
+                Ok(())
+            })?;
+    } else {
+        indices
+            .values()
+            .iter()
+            .enumerate()
+            .try_for_each::<_, Result<()>>(|(i, index)| {
+                let index = ToPrimitive::to_usize(index).ok_or_else(|| {
                     ArrowError::ComputeError("Cast to usize failed".to_string())
                 })?;
 
                 if bit_util::get_bit(values_slice, values_offset + index) {
                     bit_util::set_bit(output_slice, i);
                 }
-            }
-
-            Ok(())
-        })?;
-
+                Ok(())
+            })?;
+    }
     Ok(output_buffer.into())
 }
 
@@ -771,12 +787,11 @@ where
         };
     }
 
-    let array_data =
-        ArrayData::builder(GenericStringArray::<OffsetSize>::get_data_type())
-            .len(data_len)
-            .add_buffer(offsets_buffer.into())
-            .add_buffer(values.into())
-            .null_bit_buffer(nulls);
+    let array_data = ArrayData::builder(GenericStringArray::<OffsetSize>::DATA_TYPE)
+        .len(data_len)
+        .add_buffer(offsets_buffer.into())
+        .add_buffer(values.into())
+        .null_bit_buffer(nulls);
 
     let array_data = unsafe { array_data.build_unchecked() };
 

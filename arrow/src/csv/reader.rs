@@ -544,7 +544,7 @@ fn parse(
             let field = &fields[i];
             match field.data_type() {
                 DataType::Boolean => build_boolean_array(line_number, rows, i),
-                DataType::Decimal(precision, scale) => {
+                DataType::Decimal128(precision, scale) => {
                     build_decimal_array(line_number, rows, i, *precision, *scale)
                 }
                 DataType::Int8 => {
@@ -776,8 +776,14 @@ fn parse_decimal_with_parameter(s: &str, precision: usize, scale: usize) -> Resu
         if negative {
             result = result.neg();
         }
-        validate_decimal_precision(result, precision)
-            .map_err(|e| ArrowError::ParseError(format!("parse decimal overflow: {}", e)))
+
+        match validate_decimal_precision(result, precision) {
+            Ok(_) => Ok(result),
+            Err(e) => Err(ArrowError::ParseError(format!(
+                "parse decimal overflow: {}",
+                e
+            ))),
+        }
     } else {
         Err(ArrowError::ParseError(format!(
             "can't parse the string value {} to decimal",
@@ -1116,7 +1122,6 @@ mod tests {
     use std::io::{Cursor, Write};
     use tempfile::NamedTempFile;
 
-    use crate::array::BasicDecimalArray;
     use crate::array::*;
     use crate::compute::cast;
     use crate::datatypes::Field;
@@ -1206,8 +1211,8 @@ mod tests {
     fn test_csv_reader_with_decimal() {
         let schema = Schema::new(vec![
             Field::new("city", DataType::Utf8, false),
-            Field::new("lat", DataType::Decimal(38, 6), false),
-            Field::new("lng", DataType::Decimal(38, 6), false),
+            Field::new("lat", DataType::Decimal128(38, 6), false),
+            Field::new("lng", DataType::Decimal128(38, 6), false),
         ]);
 
         let file = File::open("test/data/decimal_test.csv").unwrap();

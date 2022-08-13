@@ -19,8 +19,7 @@ pub mod io;
 pub mod memory;
 #[macro_use]
 pub mod bit_util;
-mod bit_packing;
-pub mod cursor;
+mod bit_pack;
 pub(crate) mod interner;
 pub(crate) mod page_util;
 #[cfg(any(test, feature = "test_common"))]

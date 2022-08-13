@@ -18,7 +18,8 @@
 use crate::data_type::AsBytes;
 use hashbrown::hash_map::RawEntryMut;
 use hashbrown::HashMap;
-use std::hash::Hash;
+
+const DEFAULT_DEDUP_CAPACITY: usize = 4096;
 
 /// Storage trait for [`Interner`]
 pub trait Storage {
@@ -34,6 +35,7 @@ pub trait Storage {
 }
 
 /// A generic value interner supporting various different [`Storage`]
+#[derive(Debug, Default)]
 pub struct Interner<S: Storage> {
     state: ahash::RandomState,
 
@@ -52,14 +54,14 @@ impl<S: Storage> Interner<S> {
     pub fn new(storage: S) -> Self {
         Self {
             state: Default::default(),
-            dedup: Default::default(),
+            dedup: HashMap::with_capacity_and_hasher(DEFAULT_DEDUP_CAPACITY, ()),
             storage,
         }
     }
 
     /// Intern the value, returning the interned key, and if this was a new value
     pub fn intern(&mut self, value: &S::Value) -> S::Key {
-        let hash = compute_hash(&self.state, value);
+        let hash = self.state.hash_one(value.as_bytes());
 
         let entry = self
             .dedup
@@ -73,7 +75,7 @@ impl<S: Storage> Interner<S> {
 
                 *entry
                     .insert_with_hasher(hash, key, (), |key| {
-                        compute_hash(&self.state, self.storage.get(*key))
+                        self.state.hash_one(self.storage.get(*key).as_bytes())
                     })
                     .0
             }
@@ -84,11 +86,9 @@ impl<S: Storage> Interner<S> {
     pub fn storage(&self) -> &S {
         &self.storage
     }
-}
 
-fn compute_hash<T: AsBytes + ?Sized>(state: &ahash::RandomState, value: &T) -> u64 {
-    use std::hash::{BuildHasher, Hasher};
-    let mut hasher = state.build_hasher();
-    value.as_bytes().hash(&mut hasher);
-    hasher.finish()
+    /// Unwraps the inner storage
+    pub fn into_inner(self) -> S {
+        self.storage
+    }
 }

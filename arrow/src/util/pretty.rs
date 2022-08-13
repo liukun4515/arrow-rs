@@ -19,9 +19,8 @@
 //! available unless `feature = "prettyprint"` is enabled.
 
 use crate::{array::ArrayRef, record_batch::RecordBatch};
-use std::fmt::Display;
-
 use comfy_table::{Cell, Table};
+use std::fmt::Display;
 
 use crate::error::Result;
 

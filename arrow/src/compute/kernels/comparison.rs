@@ -35,7 +35,7 @@ use crate::datatypes::{
 };
 use crate::error::{ArrowError, Result};
 use crate::util::bit_util;
-use regex::{escape, Regex};
+use regex::Regex;
 use std::collections::HashMap;
 
 /// Helper function to perform boolean lambda function on values from two array accessors, this
@@ -169,7 +169,7 @@ where
         let re = if let Some(ref regex) = map.get(pat) {
             regex
         } else {
-            let re_pattern = escape(pat).replace('%', ".*").replace('_', ".");
+            let re_pattern = replace_like_wildcards(pat)?;
             let re = op(&re_pattern)?;
             map.insert(pat, re);
             map.get(pat).unwrap()
@@ -248,7 +248,9 @@ pub fn like_utf8_scalar<OffsetSize: OffsetSizeTrait>(
                 bit_util::set_bit(bool_slice, i);
             }
         }
-    } else if right.ends_with('%') && !right[..right.len() - 1].contains(is_like_pattern)
+    } else if right.ends_with('%')
+        && !right.ends_with("\\%")
+        && !right[..right.len() - 1].contains(is_like_pattern)
     {
         // fast path, can use starts_with
         let starts_with = &right[..right.len() - 1];
@@ -266,7 +268,7 @@ pub fn like_utf8_scalar<OffsetSize: OffsetSizeTrait>(
             }
         }
     } else {
-        let re_pattern = escape(right).replace('%', ".*").replace('_', ".");
+        let re_pattern = replace_like_wildcards(right)?;
         let re = Regex::new(&format!("^{}$", re_pattern)).map_err(|e| {
             ArrowError::ComputeError(format!(
                 "Unable to build regex from LIKE pattern: {}",
@@ -294,6 +296,43 @@ pub fn like_utf8_scalar<OffsetSize: OffsetSizeTrait>(
         )
     };
     Ok(BooleanArray::from(data))
+}
+
+/// Transforms a like `pattern` to a regex compatible pattern. To achieve that, it does:
+///
+/// 1. Replace like wildcards for regex expressions as the pattern will be evaluated using regex match: `%` => `.*` and `_` => `.`
+/// 2. Escape regex meta characters to match them and not be evaluated as regex special chars. For example: `.` => `\\.`
+/// 3. Replace escaped like wildcards removing the escape characters to be able to match it as a regex. For example: `\\%` => `%`
+fn replace_like_wildcards(pattern: &str) -> Result<String> {
+    let mut result = String::new();
+    let pattern = String::from(pattern);
+    let mut chars_iter = pattern.chars().peekable();
+    while let Some(c) = chars_iter.next() {
+        if c == '\\' {
+            let next = chars_iter.peek();
+            match next {
+                Some(next) if is_like_pattern(*next) => {
+                    result.push(*next);
+                    // Skipping the next char as it is already appended
+                    chars_iter.next();
+                }
+                _ => {
+                    result.push('\\');
+                    result.push('\\');
+                }
+            }
+        } else if regex_syntax::is_meta_character(c) {
+            result.push('\\');
+            result.push(c);
+        } else if c == '%' {
+            result.push_str(".*");
+        } else if c == '_' {
+            result.push('.');
+        } else {
+            result.push(c);
+        }
+    }
+    Ok(result)
 }
 
 /// Perform SQL `left NOT LIKE right` operation on [`StringArray`] /
@@ -330,7 +369,9 @@ pub fn nlike_utf8_scalar<OffsetSize: OffsetSizeTrait>(
         for i in 0..left.len() {
             result.append(left.value(i) != right);
         }
-    } else if right.ends_with('%') && !right[..right.len() - 1].contains(is_like_pattern)
+    } else if right.ends_with('%')
+        && !right.ends_with("\\%")
+        && !right[..right.len() - 1].contains(is_like_pattern)
     {
         // fast path, can use ends_with
         for i in 0..left.len() {
@@ -342,7 +383,7 @@ pub fn nlike_utf8_scalar<OffsetSize: OffsetSizeTrait>(
             result.append(!left.value(i).ends_with(&right[1..]));
         }
     } else {
-        let re_pattern = escape(right).replace('%', ".*").replace('_', ".");
+        let re_pattern = replace_like_wildcards(right)?;
         let re = Regex::new(&format!("^{}$", re_pattern)).map_err(|e| {
             ArrowError::ComputeError(format!(
                 "Unable to build regex from LIKE pattern: {}",
@@ -403,7 +444,9 @@ pub fn ilike_utf8_scalar<OffsetSize: OffsetSizeTrait>(
         for i in 0..left.len() {
             result.append(left.value(i) == right);
         }
-    } else if right.ends_with('%') && !right[..right.len() - 1].contains(is_like_pattern)
+    } else if right.ends_with('%')
+        && !right.ends_with("\\%")
+        && !right[..right.len() - 1].contains(is_like_pattern)
     {
         // fast path, can use ends_with
         for i in 0..left.len() {
@@ -423,7 +466,7 @@ pub fn ilike_utf8_scalar<OffsetSize: OffsetSizeTrait>(
             );
         }
     } else {
-        let re_pattern = escape(right).replace('%', ".*").replace('_', ".");
+        let re_pattern = replace_like_wildcards(right)?;
         let re = Regex::new(&format!("(?i)^{}$", re_pattern)).map_err(|e| {
             ArrowError::ComputeError(format!(
                 "Unable to build regex from ILIKE pattern: {}",
@@ -484,7 +527,9 @@ pub fn nilike_utf8_scalar<OffsetSize: OffsetSizeTrait>(
         for i in 0..left.len() {
             result.append(left.value(i) != right);
         }
-    } else if right.ends_with('%') && !right[..right.len() - 1].contains(is_like_pattern)
+    } else if right.ends_with('%')
+        && !right.ends_with("\\%")
+        && !right[..right.len() - 1].contains(is_like_pattern)
     {
         // fast path, can use ends_with
         for i in 0..left.len() {
@@ -506,7 +551,7 @@ pub fn nilike_utf8_scalar<OffsetSize: OffsetSizeTrait>(
             );
         }
     } else {
-        let re_pattern = escape(right).replace('%', ".*").replace('_', ".");
+        let re_pattern = replace_like_wildcards(right)?;
         let re = Regex::new(&format!("(?i)^{}$", re_pattern)).map_err(|e| {
             ArrowError::ComputeError(format!(
                 "Unable to build regex from ILIKE pattern: {}",
@@ -942,18 +987,19 @@ pub fn gt_eq_utf8_scalar<OffsetSize: OffsetSizeTrait>(
     compare_op_scalar(left, |a| a >= right)
 }
 
+// Avoids creating a closure for each combination of `$RIGHT` and `$TY`
+fn try_to_type_result<T>(value: Option<T>, right: &str, ty: &str) -> Result<T> {
+    value.ok_or_else(|| {
+        ArrowError::ComputeError(format!("Could not convert {} with {}", right, ty,))
+    })
+}
+
 /// Calls $RIGHT.$TY() (e.g. `right.to_i128()`) with a nice error message.
 /// Type of expression is `Result<.., ArrowError>`
 macro_rules! try_to_type {
-    ($RIGHT: expr, $TY: ident) => {{
-        $RIGHT.$TY().ok_or_else(|| {
-            ArrowError::ComputeError(format!(
-                "Could not convert {} with {}",
-                stringify!($RIGHT),
-                stringify!($TY)
-            ))
-        })
-    }};
+    ($RIGHT: expr, $TY: ident) => {
+        try_to_type_result($RIGHT.$TY(), stringify!($RIGHT), stringify!($TYPE))
+    };
 }
 
 macro_rules! dyn_compare_scalar {
@@ -1023,59 +1069,35 @@ macro_rules! dyn_compare_scalar {
         match $KT.as_ref() {
             DataType::UInt8 => {
                 let left = as_dictionary_array::<UInt8Type>($LEFT);
-                unpack_dict_comparison(
-                    left,
-                    dyn_compare_scalar!(left.values(), $RIGHT, $OP)?,
-                )
+                unpack_dict_comparison(left, $OP(left.values(), $RIGHT)?)
             }
             DataType::UInt16 => {
                 let left = as_dictionary_array::<UInt16Type>($LEFT);
-                unpack_dict_comparison(
-                    left,
-                    dyn_compare_scalar!(left.values(), $RIGHT, $OP)?,
-                )
+                unpack_dict_comparison(left, $OP(left.values(), $RIGHT)?)
             }
             DataType::UInt32 => {
                 let left = as_dictionary_array::<UInt32Type>($LEFT);
-                unpack_dict_comparison(
-                    left,
-                    dyn_compare_scalar!(left.values(), $RIGHT, $OP)?,
-                )
+                unpack_dict_comparison(left, $OP(left.values(), $RIGHT)?)
             }
             DataType::UInt64 => {
                 let left = as_dictionary_array::<UInt64Type>($LEFT);
-                unpack_dict_comparison(
-                    left,
-                    dyn_compare_scalar!(left.values(), $RIGHT, $OP)?,
-                )
+                unpack_dict_comparison(left, $OP(left.values(), $RIGHT)?)
             }
             DataType::Int8 => {
                 let left = as_dictionary_array::<Int8Type>($LEFT);
-                unpack_dict_comparison(
-                    left,
-                    dyn_compare_scalar!(left.values(), $RIGHT, $OP)?,
-                )
+                unpack_dict_comparison(left, $OP(left.values(), $RIGHT)?)
             }
             DataType::Int16 => {
                 let left = as_dictionary_array::<Int16Type>($LEFT);
-                unpack_dict_comparison(
-                    left,
-                    dyn_compare_scalar!(left.values(), $RIGHT, $OP)?,
-                )
+                unpack_dict_comparison(left, $OP(left.values(), $RIGHT)?)
             }
             DataType::Int32 => {
                 let left = as_dictionary_array::<Int32Type>($LEFT);
-                unpack_dict_comparison(
-                    left,
-                    dyn_compare_scalar!(left.values(), $RIGHT, $OP)?,
-                )
+                unpack_dict_comparison(left, $OP(left.values(), $RIGHT)?)
             }
             DataType::Int64 => {
                 let left = as_dictionary_array::<Int64Type>($LEFT);
-                unpack_dict_comparison(
-                    left,
-                    dyn_compare_scalar!(left.values(), $RIGHT, $OP)?,
-                )
+                unpack_dict_comparison(left, $OP(left.values(), $RIGHT)?)
             }
             _ => Err(ArrowError::ComputeError(format!(
                 "Unsupported dictionary key type {:?}",
@@ -1141,7 +1163,7 @@ where
 {
     match left.data_type() {
         DataType::Dictionary(key_type, _value_type) => {
-            dyn_compare_scalar!(left, right, key_type, eq_scalar)
+            dyn_compare_scalar!(left, right, key_type, eq_dyn_scalar)
         }
         _ => dyn_compare_scalar!(left, right, eq_scalar),
     }
@@ -1155,7 +1177,7 @@ where
 {
     match left.data_type() {
         DataType::Dictionary(key_type, _value_type) => {
-            dyn_compare_scalar!(left, right, key_type, lt_scalar)
+            dyn_compare_scalar!(left, right, key_type, lt_dyn_scalar)
         }
         _ => dyn_compare_scalar!(left, right, lt_scalar),
     }
@@ -1169,7 +1191,7 @@ where
 {
     match left.data_type() {
         DataType::Dictionary(key_type, _value_type) => {
-            dyn_compare_scalar!(left, right, key_type, lt_eq_scalar)
+            dyn_compare_scalar!(left, right, key_type, lt_eq_dyn_scalar)
         }
         _ => dyn_compare_scalar!(left, right, lt_eq_scalar),
     }
@@ -1183,7 +1205,7 @@ where
 {
     match left.data_type() {
         DataType::Dictionary(key_type, _value_type) => {
-            dyn_compare_scalar!(left, right, key_type, gt_scalar)
+            dyn_compare_scalar!(left, right, key_type, gt_dyn_scalar)
         }
         _ => dyn_compare_scalar!(left, right, gt_scalar),
     }
@@ -1197,7 +1219,7 @@ where
 {
     match left.data_type() {
         DataType::Dictionary(key_type, _value_type) => {
-            dyn_compare_scalar!(left, right, key_type, gt_eq_scalar)
+            dyn_compare_scalar!(left, right, key_type, gt_eq_dyn_scalar)
         }
         _ => dyn_compare_scalar!(left, right, gt_eq_scalar),
     }
@@ -1211,7 +1233,7 @@ where
 {
     match left.data_type() {
         DataType::Dictionary(key_type, _value_type) => {
-            dyn_compare_scalar!(left, right, key_type, neq_scalar)
+            dyn_compare_scalar!(left, right, key_type, neq_dyn_scalar)
         }
         _ => dyn_compare_scalar!(left, right, neq_scalar),
     }
@@ -3739,6 +3761,50 @@ mod tests {
         like_utf8_scalar,
         vec![false, true, false, false]
     );
+
+    test_utf8_scalar!(
+        test_utf8_scalar_like_escape,
+        vec!["a%", "a\\x"],
+        "a\\%",
+        like_utf8_scalar,
+        vec![true, false]
+    );
+
+    test_utf8!(
+        test_utf8_scalar_ilike_regex,
+        vec!["%%%"],
+        vec![r#"\%_\%"#],
+        ilike_utf8,
+        vec![true]
+    );
+
+    #[test]
+    fn test_replace_like_wildcards() {
+        let a_eq = "_%";
+        let expected = "..*";
+        assert_eq!(replace_like_wildcards(a_eq).unwrap(), expected);
+    }
+
+    #[test]
+    fn test_replace_like_wildcards_leave_like_meta_chars() {
+        let a_eq = "\\%\\_";
+        let expected = "%_";
+        assert_eq!(replace_like_wildcards(a_eq).unwrap(), expected);
+    }
+
+    #[test]
+    fn test_replace_like_wildcards_with_multiple_escape_chars() {
+        let a_eq = "\\\\%";
+        let expected = "\\\\%";
+        assert_eq!(replace_like_wildcards(a_eq).unwrap(), expected);
+    }
+
+    #[test]
+    fn test_replace_like_wildcards_escape_regex_meta_char() {
+        let a_eq = ".";
+        let expected = "\\.";
+        assert_eq!(replace_like_wildcards(a_eq).unwrap(), expected);
+    }
 
     test_utf8!(
         test_utf8_array_eq,

@@ -39,11 +39,7 @@ use crate::ipc;
 use crate::record_batch::RecordBatch;
 use crate::util::bit_util;
 
-use crate::ipc::compression::ipc_compression::CompressionCodecType;
-use crate::ipc::compression::{
-    LENGTH_EMPTY_COMPRESSED_DATA, LENGTH_NO_COMPRESSED_DATA, LENGTH_OF_PREFIX_DATA,
-};
-use crate::ipc::CompressionType;
+use crate::ipc::compression::CompressionCodec;
 use ipc::CONTINUATION_MARKER;
 
 /// IPC write options used to control the behaviour of the writer
@@ -63,50 +59,29 @@ pub struct IpcWriteOptions {
     /// version 2.0.0: V4, with legacy format enabled
     /// version 4.0.0: V5
     metadata_version: ipc::MetadataVersion,
-    batch_compression_type: Option<CompressionCodecType>,
+    /// Compression, if desired. Only supported when `ipc_compression`
+    /// feature is enabled
+    batch_compression_type: Option<ipc::CompressionType>,
 }
 
 impl IpcWriteOptions {
-    #[cfg(any(feature = "ipc_compression", test))]
-    pub fn try_new_with_compression(
-        alignment: usize,
-        write_legacy_ipc_format: bool,
-        metadata_version: ipc::MetadataVersion,
-        batch_compression_type: Option<CompressionCodecType>,
+    /// Configures compression when writing IPC files. Requires the
+    /// `ipc_compression` feature of the crate to be activated.
+    #[cfg(feature = "ipc_compression")]
+    pub fn try_with_compression(
+        mut self,
+        batch_compression_type: Option<ipc::CompressionType>,
     ) -> Result<Self> {
-        if alignment == 0 || alignment % 8 != 0 {
+        self.batch_compression_type = batch_compression_type;
+
+        if self.batch_compression_type.is_some()
+            && self.metadata_version < ipc::MetadataVersion::V5
+        {
             return Err(ArrowError::InvalidArgumentError(
-                "Alignment should be greater than 0 and be a multiple of 8".to_string(),
+                "Compression only supported in metadata v5 and above".to_string(),
             ));
         }
-        match batch_compression_type {
-            None => {}
-            _ => {
-                if metadata_version < ipc::MetadataVersion::V5 {
-                    return Err(ArrowError::InvalidArgumentError(
-                        "Compression only supported in metadata v5 and above".to_string(),
-                    ));
-                }
-            }
-        };
-        match metadata_version {
-            ipc::MetadataVersion::V5 => {
-                if write_legacy_ipc_format {
-                    Err(ArrowError::InvalidArgumentError(
-                        "Legacy IPC format only supported on metadata version 4"
-                            .to_string(),
-                    ))
-                } else {
-                    Ok(Self {
-                        alignment,
-                        write_legacy_ipc_format,
-                        metadata_version,
-                        batch_compression_type,
-                    })
-                }
-            }
-            z => panic!("Unsupported ipc::MetadataVersion {:?}", z),
-        }
+        Ok(self)
     }
     /// Try create IpcWriteOptions, checking for incompatible settings
     pub fn try_new(
@@ -146,7 +121,10 @@ impl IpcWriteOptions {
                     })
                 }
             }
-            z => panic!("Unsupported ipc::MetadataVersion {:?}", z),
+            z => Err(ArrowError::InvalidArgumentError(format!(
+                "Unsupported ipc::MetadataVersion {:?}",
+                z
+            ))),
         }
     }
 }
@@ -328,7 +306,7 @@ impl IpcDataGenerator {
                         dict_id,
                         dict_values,
                         write_options,
-                    ));
+                    )?);
                 }
             }
             _ => self._encode_dictionaries(
@@ -362,7 +340,7 @@ impl IpcDataGenerator {
             )?;
         }
 
-        let encoded_message = self.record_batch_to_bytes(batch, write_options);
+        let encoded_message = self.record_batch_to_bytes(batch, write_options)?;
         Ok((encoded_dictionaries, encoded_message))
     }
 
@@ -372,7 +350,7 @@ impl IpcDataGenerator {
         &self,
         batch: &RecordBatch,
         write_options: &IpcWriteOptions,
-    ) -> EncodedData {
+    ) -> Result<EncodedData> {
         let mut fbb = FlatBufferBuilder::new();
 
         let mut nodes: Vec<ipc::FieldNode> = vec![];
@@ -381,19 +359,18 @@ impl IpcDataGenerator {
         let mut offset = 0;
 
         // get the type of compression
-        let compression_codec = write_options.batch_compression_type;
-        let compression_type: Option<CompressionType> =
-            compression_codec.map(|v| v.into());
-        let compression = {
-            if let Some(codec) = compression_type {
-                let mut c = ipc::BodyCompressionBuilder::new(&mut fbb);
-                c.add_method(ipc::BodyCompressionMethod::BUFFER);
-                c.add_codec(codec);
-                Some(c.finish())
-            } else {
-                None
-            }
-        };
+        let batch_compression_type = write_options.batch_compression_type;
+
+        let compression = batch_compression_type.map(|batch_compression_type| {
+            let mut c = ipc::BodyCompressionBuilder::new(&mut fbb);
+            c.add_method(ipc::BodyCompressionMethod::BUFFER);
+            c.add_codec(batch_compression_type);
+            c.finish()
+        });
+
+        let compression_codec: Option<CompressionCodec> =
+            batch_compression_type.map(TryInto::try_into).transpose()?;
+
         for array in batch.columns() {
             let array_data = array.data();
             offset = write_array_data(
@@ -406,7 +383,7 @@ impl IpcDataGenerator {
                 array.null_count(),
                 &compression_codec,
                 write_options,
-            );
+            )?;
         }
         // pad the tail of body data
         let len = arrow_data.len();
@@ -437,10 +414,10 @@ impl IpcDataGenerator {
         fbb.finish(root, None);
         let finished_data = fbb.finished_data();
 
-        EncodedData {
+        Ok(EncodedData {
             ipc_message: finished_data.to_vec(),
             arrow_data,
-        }
+        })
     }
 
     /// Write dictionary values into two sets of bytes, one for the header (ipc::Message) and the
@@ -450,7 +427,7 @@ impl IpcDataGenerator {
         dict_id: i64,
         array_data: &ArrayData,
         write_options: &IpcWriteOptions,
-    ) -> EncodedData {
+    ) -> Result<EncodedData> {
         let mut fbb = FlatBufferBuilder::new();
 
         let mut nodes: Vec<ipc::FieldNode> = vec![];
@@ -458,19 +435,19 @@ impl IpcDataGenerator {
         let mut arrow_data: Vec<u8> = vec![];
 
         // get the type of compression
-        let compression_codec = write_options.batch_compression_type;
-        let compression_type: Option<CompressionType> =
-            compression_codec.map(|v| v.into());
-        let compression = {
-            if let Some(codec) = compression_type {
-                let mut c = ipc::BodyCompressionBuilder::new(&mut fbb);
-                c.add_method(ipc::BodyCompressionMethod::BUFFER);
-                c.add_codec(codec);
-                Some(c.finish())
-            } else {
-                None
-            }
-        };
+        let batch_compression_type = write_options.batch_compression_type;
+
+        let compression = batch_compression_type.map(|batch_compression_type| {
+            let mut c = ipc::BodyCompressionBuilder::new(&mut fbb);
+            c.add_method(ipc::BodyCompressionMethod::BUFFER);
+            c.add_codec(batch_compression_type);
+            c.finish()
+        });
+
+        let compression_codec: Option<CompressionCodec> = batch_compression_type
+            .map(|batch_compression_type| batch_compression_type.try_into())
+            .transpose()?;
+
         write_array_data(
             array_data,
             &mut buffers,
@@ -481,7 +458,7 @@ impl IpcDataGenerator {
             array_data.null_count(),
             &compression_codec,
             write_options,
-        );
+        )?;
 
         // pad the tail of body data
         let len = arrow_data.len();
@@ -522,10 +499,10 @@ impl IpcDataGenerator {
         fbb.finish(root, None);
         let finished_data = fbb.finished_data();
 
-        EncodedData {
+        Ok(EncodedData {
             ipc_message: finished_data.to_vec(),
             arrow_data,
-        }
+        })
     }
 }
 
@@ -614,13 +591,11 @@ impl<W: Write> FileWriter<W> {
     ) -> Result<Self> {
         let data_gen = IpcDataGenerator::default();
         let mut writer = BufWriter::new(writer);
-        // write magic to header
-        let mut header_size: usize = 0;
+        // write magic to header aligned on 8 byte boundary
+        let header_size = super::ARROW_MAGIC.len() + 2;
+        assert_eq!(header_size, 8);
         writer.write_all(&super::ARROW_MAGIC[..])?;
-        header_size += super::ARROW_MAGIC.len();
-        // create an 8-byte boundary after the header
         writer.write_all(&[0, 0])?;
-        header_size += 2;
         // write the schema, set the written bytes to the schema + header
         let encoded_message = data_gen.schema_to_bytes(schema, &write_options);
         let (meta, data) = write_message(&mut writer, encoded_message, &write_options)?;
@@ -982,6 +957,16 @@ fn get_buffer_element_width(spec: &BufferSpec) -> usize {
     }
 }
 
+/// Returns byte width for binary value_offset buffer spec.
+#[inline]
+fn get_value_offset_byte_width(data_type: &DataType) -> usize {
+    match data_type {
+        DataType::Binary | DataType::Utf8 => 4,
+        DataType::LargeBinary | DataType::LargeUtf8 => 8,
+        _ => unreachable!(),
+    }
+}
+
 /// Returns the number of total bytes in base binary arrays.
 fn get_binary_buffer_len(array_data: &ArrayData) -> usize {
     if array_data.is_empty() {
@@ -1072,9 +1057,9 @@ fn write_array_data(
     offset: i64,
     num_rows: usize,
     null_count: usize,
-    compression_codec: &Option<CompressionCodecType>,
+    compression_codec: &Option<CompressionCodec>,
     write_options: &IpcWriteOptions,
-) -> i64 {
+) -> Result<i64> {
     let mut offset = offset;
     if !matches!(array_data.data_type(), DataType::Null) {
         nodes.push(ipc::FieldNode::new(num_rows as i64, null_count as i64));
@@ -1102,7 +1087,7 @@ fn write_array_data(
             arrow_data,
             offset,
             compression_codec,
-        );
+        )?;
     }
 
     let data_type = array_data.data_type();
@@ -1110,13 +1095,16 @@ fn write_array_data(
         data_type,
         DataType::Binary | DataType::LargeBinary | DataType::Utf8 | DataType::LargeUtf8
     ) {
-        let total_bytes = get_binary_buffer_len(array_data);
-        let value_buffer = &array_data.buffers()[1];
+        let offset_buffer = &array_data.buffers()[0];
+        let value_offset_byte_width = get_value_offset_byte_width(data_type);
+        let min_length = (array_data.len() + 1) * value_offset_byte_width;
         if buffer_need_truncate(
             array_data.offset(),
-            value_buffer,
-            &BufferSpec::VariableWidth,
-            total_bytes,
+            offset_buffer,
+            &BufferSpec::FixedWidth {
+                byte_width: value_offset_byte_width,
+            },
+            min_length,
         ) {
             // Rebase offsets and truncate values
             let (new_offsets, byte_offset) =
@@ -1138,8 +1126,10 @@ fn write_array_data(
                 arrow_data,
                 offset,
                 compression_codec,
-            );
+            )?;
 
+            let total_bytes = get_binary_buffer_len(array_data);
+            let value_buffer = &array_data.buffers()[1];
             let buffer_length = min(total_bytes, value_buffer.len() - byte_offset);
             let buffer_slice =
                 &value_buffer.as_slice()[byte_offset..(byte_offset + buffer_length)];
@@ -1149,17 +1139,17 @@ fn write_array_data(
                 arrow_data,
                 offset,
                 compression_codec,
-            );
+            )?;
         } else {
-            array_data.buffers().iter().for_each(|buffer| {
+            for buffer in array_data.buffers() {
                 offset = write_buffer(
                     buffer.as_slice(),
                     buffers,
                     arrow_data,
                     offset,
                     compression_codec,
-                );
-            });
+                )?;
+            }
         }
     } else if DataType::is_numeric(data_type)
         || DataType::is_temporal(data_type)
@@ -1188,7 +1178,7 @@ fn write_array_data(
                 arrow_data,
                 offset,
                 compression_codec,
-            );
+            )?;
         } else {
             offset = write_buffer(
                 buffer.as_slice(),
@@ -1196,17 +1186,18 @@ fn write_array_data(
                 arrow_data,
                 offset,
                 compression_codec,
-            );
+            )?;
         }
     } else {
-        array_data.buffers().iter().for_each(|buffer| {
-            offset = write_buffer(buffer, buffers, arrow_data, offset, compression_codec);
-        });
+        for buffer in array_data.buffers() {
+            offset =
+                write_buffer(buffer, buffers, arrow_data, offset, compression_codec)?;
+        }
     }
 
     if !matches!(array_data.data_type(), DataType::Dictionary(_, _)) {
         // recursively write out nested structures
-        array_data.child_data().iter().for_each(|data_ref| {
+        for data_ref in array_data.child_data() {
             // write the nested data (e.g list data)
             offset = write_array_data(
                 data_ref,
@@ -1218,14 +1209,17 @@ fn write_array_data(
                 data_ref.null_count(),
                 compression_codec,
                 write_options,
-            );
-        });
+            )?;
+        }
     }
 
-    offset
+    Ok(offset)
 }
 
-/// Write a buffer to a vector of bytes, and add its ipc::Buffer to a vector
+/// Write a buffer into `arrow_data`, a vector of bytes, and adds its
+/// [`ipc::Buffer`] to `buffers`. Returns the new offset in `arrow_data`
+///
+///
 /// From <https://github.com/apache/arrow/blob/6a936c4ff5007045e86f65f1a6b6c3c955ad5103/format/Message.fbs#L58>
 /// Each constituent buffer is first compressed with the indicated
 /// compressor, and then written with the uncompressed length in the first 8
@@ -1235,61 +1229,34 @@ fn write_array_data(
 /// follows is not compressed, which can be useful for cases where
 /// compression does not yield appreciable savings.
 fn write_buffer(
-    buffer: &[u8],
-    buffers: &mut Vec<ipc::Buffer>,
-    arrow_data: &mut Vec<u8>,
-    offset: i64,
-    compression_codec: &Option<CompressionCodecType>,
-) -> i64 {
-    let origin_buffer_len = buffer.len();
-    let mut _compression_buffer = Vec::<u8>::new();
-    let (data, uncompression_buffer_len) = match compression_codec {
+    buffer: &[u8],                  // input
+    buffers: &mut Vec<ipc::Buffer>, // output buffer descriptors
+    arrow_data: &mut Vec<u8>,       // output stream
+    offset: i64,                    // current output stream offset
+    compression_codec: &Option<CompressionCodec>,
+) -> Result<i64> {
+    let len: i64 = match compression_codec {
+        Some(compressor) => compressor.compress_to_vec(buffer, arrow_data)?,
         None => {
-            // this buffer_len will not used in the following logic
-            // If we don't use the compression, just write the data in the array
-            (buffer, origin_buffer_len as i64)
+            arrow_data.extend_from_slice(buffer);
+            buffer.len()
         }
-        Some(_compressor) => {
-            if cfg!(feature = "ipc_compression") || cfg!(test) {
-                if (origin_buffer_len as i64) == LENGTH_EMPTY_COMPRESSED_DATA {
-                    (buffer, LENGTH_EMPTY_COMPRESSED_DATA)
-                } else {
-                    #[cfg(any(feature = "ipc_compression", test))]
-                    _compressor
-                        .compress(buffer, &mut _compression_buffer)
-                        .unwrap();
-                    let compression_len = _compression_buffer.len();
-                    if compression_len > origin_buffer_len {
-                        // the length of compressed data is larger than uncompressed data
-                        // use the uncompressed data with -1
-                        // -1 indicate that we don't compress the data
-                        (buffer, LENGTH_NO_COMPRESSED_DATA)
-                    } else {
-                        // use the compressed data with uncompressed length
-                        (_compression_buffer.as_slice(), origin_buffer_len as i64)
-                    }
-                }
-            } else {
-                panic!("IPC compression not supported. Compile with feature 'ipc_compression' to enable");
-            }
-        }
-    };
-    let len = data.len() as i64;
-    let total_len = if compression_codec.is_none() {
-        buffers.push(ipc::Buffer::new(offset, len));
-        len
-    } else {
-        buffers.push(ipc::Buffer::new(offset, LENGTH_OF_PREFIX_DATA + len));
-        // write the prefix of the uncompressed length
-        let uncompression_len_buf: [u8; 8] = uncompression_buffer_len.to_le_bytes();
-        arrow_data.extend_from_slice(&uncompression_len_buf);
-        LENGTH_OF_PREFIX_DATA + len
-    };
-    arrow_data.extend_from_slice(data);
+    }
+    .try_into()
+    .map_err(|e| {
+        ArrowError::InvalidArgumentError(format!(
+            "Could not convert compressed size to i64: {}",
+            e
+        ))
+    })?;
+
+    // make new index entry
+    buffers.push(ipc::Buffer::new(offset, len));
     // padding and make offset 8 bytes aligned
     let pad_len = pad_to_8(len as u32) as i64;
     arrow_data.extend_from_slice(&vec![0u8; pad_len as usize][..]);
-    offset + total_len + pad_len
+
+    Ok(offset + len + pad_len)
 }
 
 /// Calculate an 8-byte boundary and return the number of bytes needed to pad to 8 bytes
@@ -1315,7 +1282,8 @@ mod tests {
     use crate::util::integration_util::*;
 
     #[test]
-    fn test_write_with_empty_record_batch() {
+    #[cfg(feature = "ipc_compression")]
+    fn test_write_empty_record_batch_lz4_compression() {
         let file_name = "arrow_lz4_empty";
         let schema = Schema::new(vec![Field::new("field1", DataType::Int32, true)]);
         let values: Vec<Option<i32>> = vec![];
@@ -1327,13 +1295,12 @@ mod tests {
             let file =
                 File::create(format!("target/debug/testdata/{}.arrow_file", file_name))
                     .unwrap();
-            let write_option = IpcWriteOptions::try_new_with_compression(
-                8,
-                false,
-                ipc::MetadataVersion::V5,
-                Some(CompressionCodecType::Lz4Frame),
-            )
-            .unwrap();
+            let write_option =
+                IpcWriteOptions::try_new(8, false, ipc::MetadataVersion::V5)
+                    .unwrap()
+                    .try_with_compression(Some(ipc::CompressionType::LZ4_FRAME))
+                    .unwrap();
+
             let mut writer =
                 FileWriter::try_new_with_options(file, &schema, write_option).unwrap();
             writer.write(&record_batch).unwrap();
@@ -1368,7 +1335,9 @@ mod tests {
             }
         }
     }
+
     #[test]
+    #[cfg(feature = "ipc_compression")]
     fn test_write_file_with_lz4_compression() {
         let schema = Schema::new(vec![Field::new("field1", DataType::Int32, true)]);
         let values: Vec<Option<i32>> = vec![Some(12), Some(1)];
@@ -1379,13 +1348,12 @@ mod tests {
         {
             let file =
                 File::create("target/debug/testdata/arrow_lz4.arrow_file").unwrap();
-            let write_option = IpcWriteOptions::try_new_with_compression(
-                8,
-                false,
-                ipc::MetadataVersion::V5,
-                Some(CompressionCodecType::Lz4Frame),
-            )
-            .unwrap();
+            let write_option =
+                IpcWriteOptions::try_new(8, false, ipc::MetadataVersion::V5)
+                    .unwrap()
+                    .try_with_compression(Some(ipc::CompressionType::LZ4_FRAME))
+                    .unwrap();
+
             let mut writer =
                 FileWriter::try_new_with_options(file, &schema, write_option).unwrap();
             writer.write(&record_batch).unwrap();
@@ -1422,6 +1390,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "ipc_compression")]
     fn test_write_file_with_zstd_compression() {
         let schema = Schema::new(vec![Field::new("field1", DataType::Int32, true)]);
         let values: Vec<Option<i32>> = vec![Some(12), Some(1)];
@@ -1432,13 +1401,12 @@ mod tests {
         {
             let file =
                 File::create("target/debug/testdata/arrow_zstd.arrow_file").unwrap();
-            let write_option = IpcWriteOptions::try_new_with_compression(
-                8,
-                false,
-                ipc::MetadataVersion::V5,
-                Some(CompressionCodecType::Zstd),
-            )
-            .unwrap();
+            let write_option =
+                IpcWriteOptions::try_new(8, false, ipc::MetadataVersion::V5)
+                    .unwrap()
+                    .try_with_compression(Some(ipc::CompressionType::ZSTD))
+                    .unwrap();
+
             let mut writer =
                 FileWriter::try_new_with_options(file, &schema, write_option).unwrap();
             writer.write(&record_batch).unwrap();
@@ -1650,7 +1618,7 @@ mod tests {
 
             // read expected JSON output
             let arrow_json = read_gzip_json(version, path);
-            assert!(arrow_json.equals_reader(&mut reader));
+            assert!(arrow_json.equals_reader(&mut reader).unwrap());
         });
     }
 
@@ -1701,7 +1669,7 @@ mod tests {
 
             // read expected JSON output
             let arrow_json = read_gzip_json(version, path);
-            assert!(arrow_json.equals_reader(&mut reader));
+            assert!(arrow_json.equals_reader(&mut reader).unwrap());
         });
     }
 
@@ -1765,7 +1733,7 @@ mod tests {
 
             // read expected JSON output
             let arrow_json = read_gzip_json(version, path);
-            assert!(arrow_json.equals_reader(&mut reader));
+            assert!(arrow_json.equals_reader(&mut reader).unwrap());
         });
     }
 
@@ -1826,11 +1794,12 @@ mod tests {
 
             // read expected JSON output
             let arrow_json = read_gzip_json(version, path);
-            assert!(arrow_json.equals_reader(&mut reader));
+            assert!(arrow_json.equals_reader(&mut reader).unwrap());
         });
     }
 
     #[test]
+    #[cfg(feature = "ipc_compression")]
     fn read_and_rewrite_compression_files_200() {
         let testdata = crate::util::test_util::arrow_test_data();
         let version = "2.0.0-compression";
@@ -1853,13 +1822,12 @@ mod tests {
                 ))
                 .unwrap();
                 // write IPC version 5
-                let options = IpcWriteOptions::try_new_with_compression(
-                    8,
-                    false,
-                    ipc::MetadataVersion::V5,
-                    Some(CompressionCodecType::Lz4Frame),
-                )
-                .unwrap();
+                let options =
+                    IpcWriteOptions::try_new(8, false, ipc::MetadataVersion::V5)
+                        .unwrap()
+                        .try_with_compression(Some(ipc::CompressionType::LZ4_FRAME))
+                        .unwrap();
+
                 let mut writer =
                     FileWriter::try_new_with_options(file, &reader.schema(), options)
                         .unwrap();
@@ -1878,11 +1846,12 @@ mod tests {
 
             // read expected JSON output
             let arrow_json = read_gzip_json(version, path);
-            assert!(arrow_json.equals_reader(&mut reader));
+            assert!(arrow_json.equals_reader(&mut reader).unwrap());
         });
     }
 
     #[test]
+    #[cfg(feature = "ipc_compression")]
     fn read_and_rewrite_compression_stream_200() {
         let testdata = crate::util::test_util::arrow_test_data();
         let version = "2.0.0-compression";
@@ -1904,13 +1873,12 @@ mod tests {
                     version, path
                 ))
                 .unwrap();
-                let options = IpcWriteOptions::try_new_with_compression(
-                    8,
-                    false,
-                    ipc::MetadataVersion::V5,
-                    Some(CompressionCodecType::Zstd),
-                )
-                .unwrap();
+                let options =
+                    IpcWriteOptions::try_new(8, false, ipc::MetadataVersion::V5)
+                        .unwrap()
+                        .try_with_compression(Some(ipc::CompressionType::ZSTD))
+                        .unwrap();
+
                 let mut writer =
                     StreamWriter::try_new_with_options(file, &reader.schema(), options)
                         .unwrap();
@@ -1927,7 +1895,7 @@ mod tests {
 
             // read expected JSON output
             let arrow_json = read_gzip_json(version, path);
-            assert!(arrow_json.equals_reader(&mut reader));
+            assert!(arrow_json.equals_reader(&mut reader).unwrap());
         });
     }
 
@@ -2277,6 +2245,23 @@ mod tests {
         assert!(structs.column(0).is_valid(1));
         assert!(structs.column(1).is_valid(0));
         assert!(structs.column(1).is_null(1));
+        assert_eq!(record_batch_slice, deserialized_batch);
+    }
+
+    #[test]
+    fn truncate_ipc_string_array_with_all_empty_string() {
+        fn create_batch() -> RecordBatch {
+            let schema = Schema::new(vec![Field::new("a", DataType::Utf8, true)]);
+            let a =
+                StringArray::from(vec![Some(""), Some(""), Some(""), Some(""), Some("")]);
+            RecordBatch::try_new(Arc::new(schema), vec![Arc::new(a)]).unwrap()
+        }
+
+        let record_batch = create_batch();
+        let record_batch_slice = record_batch.slice(0, 1);
+        let deserialized_batch = deserialize(serialize(&record_batch_slice));
+
+        assert!(serialize(&record_batch).len() > serialize(&record_batch_slice).len());
         assert_eq!(record_batch_slice, deserialized_batch);
     }
 }
